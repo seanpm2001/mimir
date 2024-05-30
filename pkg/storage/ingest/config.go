@@ -92,6 +92,7 @@ type KafkaConfig struct {
 
 	// Used when logging unsampled client errors. Set from ingester's ErrorSampleRate.
 	FallbackClientErrorSampleRate int64 `yaml:"-"`
+	ReplayConcurrency             int   `yaml:"replay_concurrency"`
 }
 
 func (cfg *KafkaConfig) RegisterFlags(f *flag.FlagSet) {
@@ -126,6 +127,7 @@ func (cfg *KafkaConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) 
 	f.Int64Var(&cfg.ProducerMaxBufferedBytes, prefix+".producer-max-buffered-bytes", 1024*1024*1024, "The maximum size of (uncompressed) buffered and unacknowledged produced records sent to Kafka. The produce request fails once this limit is reached. This limit is per Kafka client. 0 to disable the limit.")
 
 	f.DurationVar(&cfg.WaitStrongReadConsistencyTimeout, prefix+".wait-strong-read-consistency-timeout", 20*time.Second, "The maximum allowed for a read requests processed by an ingester to wait until strong read consistency is enforced. 0 to disable the timeout.")
+	f.IntVar(&cfg.ReplayConcurrency, prefix+".replay-concurrency", 1, "The number of concurrent fetch requests that the ingester sends to kafka when catching up during startup.")
 }
 
 func (cfg *KafkaConfig) Validate() error {
