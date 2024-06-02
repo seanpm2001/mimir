@@ -36,6 +36,7 @@ type BlockBuilder struct {
 	assignment   map[string][]int32
 }
 
+// TODO(codesome): consider using ingest.PartitionReader, probably be extending it.
 func NewBlockBuilder(
 	cfg Config,
 	logger log.Logger,
@@ -216,7 +217,6 @@ func (b *BlockBuilder) nextConsumeCycle(ctx context.Context, mark time.Time) err
 	b.assignmentMu.Lock()
 	assignment := b.assignment
 	b.assignmentMu.Unlock()
-
 	assignmentParts, ok := assignment[b.cfg.Kafka.Topic]
 	if !ok || len(assignmentParts) == 0 {
 		return fmt.Errorf("no partitions assigned (%+v): topic %s", assignmentParts, b.cfg.Kafka.Topic)
@@ -274,7 +274,6 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 	// client for the partition (i.e. when the partition is newly assigned). After that we can
 	// simply use the resume-pause logic below when BB is running and don't need to get the commit
 	// for every cycle.
-
 	// TopicPartition to resume consuming on this iteration.
 	tp := map[string][]int32{b.cfg.Kafka.Topic: {part}}
 
@@ -331,6 +330,12 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
 			level.Info(b.logger).Log("msg", "consumed", "part", ftp.Partition, "hi", ftp.HighWatermark, "lo", ftp.LogStartOffset, "batch_size", len(ftp.Records))
 
+			if ftp.Err != nil {
+				level.Error(b.logger).Log("msg", "failed to fetch records", "part", ftp.Partition, "err", ftp.Err)
+				// TODO(codesome): add metric?
+				return
+			}
+
 			for _, rec := range ftp.Records {
 				// When BB is first deployed or if it is lagging behind, then it might consuming data from too much
 				// in the past. In which case if we try to consume all at once, it can overwhelm the system.
@@ -379,14 +384,19 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 		b.kafkaClient.AllowRebalance()
 	}
 
-	if err := builder.compactAndRemoveDBs(ctx); err != nil {
-		// TODO(codesome): add metric
-		return err
+	if builder != nil {
+		if err := builder.compactAndRemoveDBs(ctx); err != nil {
+			// TODO(codesome): add metric
+			return err
+		}
 	}
 
 	// TODO(codesome): store the lastOffset and currEnd as a metadata in the checkpoint
 	_ = lastOffset // to avoid unused error. TODO: remove this once used
-	return b.commitOffset(ctx, part, checkpointOffset)
+	if checkpointOffset > 0 {
+		return b.commitOffset(ctx, part, checkpointOffset)
+	}
+	return nil
 }
 
 func (b *BlockBuilder) commitOffset(ctx context.Context, part int32, offset int64) (returnErr error) {
