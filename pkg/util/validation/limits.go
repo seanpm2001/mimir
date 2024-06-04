@@ -223,7 +223,8 @@ type Limits struct {
 	AlertmanagerMaxAlertsSizeBytes             int `yaml:"alertmanager_max_alerts_size_bytes" json:"alertmanager_max_alerts_size_bytes"`
 
 	// OpenTelemetry
-	OTelMetricSuffixesEnabled bool `yaml:"otel_metric_suffixes_enabled" json:"otel_metric_suffixes_enabled" category:"advanced"`
+	OTelMetricSuffixesEnabled     bool     `yaml:"otel_metric_suffixes_enabled" json:"otel_metric_suffixes_enabled" category:"advanced"`
+	PromoteOTelResourceAttributes []string `yaml:"promote_otel_resource_attributes" json:"promote_otel_resource_attributes" category:"experimental"`
 
 	// Ingest storage.
 	IngestStorageReadConsistency       string `yaml:"ingest_storage_read_consistency" json:"ingest_storage_read_consistency" category:"experimental" doc:"hidden"`
@@ -994,6 +995,32 @@ func (o *Overrides) ResultsCacheForUnalignedQueryEnabled(userID string) bool {
 
 func (o *Overrides) OTelMetricSuffixesEnabled(tenantID string) bool {
 	return o.getOverridesForUser(tenantID).OTelMetricSuffixesEnabled
+}
+
+func (o *Overrides) PromoteOTelResourceAttributes(tenantID string) []string {
+	promote := o.getOverridesForUser(tenantID).PromoteOTelResourceAttributes
+	if promote == nil {
+		promote = []string{
+			"cloud.availability_zone",
+			"cloud.region",
+			"container.name",
+			"deployment.environment",
+			"k8s.cluster.name",
+			"k8s.container.name",
+			"k8s.cronjob.name",
+			"k8s.daemonset.name",
+			"k8s.deployment.name",
+			"k8s.job.name",
+			"k8s.namespace.name",
+			"k8s.pod.name",
+			"k8s.replicaset.name",
+			"k8s.statefulset.name",
+			"service.instance.id",
+			"service.name",
+			"service.namespace",
+		}
+	}
+	return promote
 }
 
 func (o *Overrides) AlignQueriesWithStep(userID string) bool {

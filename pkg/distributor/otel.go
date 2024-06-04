@@ -156,18 +156,19 @@ func OTLPHandler(
 			return err
 		}
 		addSuffixes := limits.OTelMetricSuffixesEnabled(tenantID)
+		promoteResourceAttributes := limits.PromoteOTelResourceAttributes(tenantID)
 
 		pushMetrics.IncOTLPRequest(tenantID)
 		pushMetrics.ObserveUncompressedBodySize(tenantID, float64(uncompressedBodySize))
 
 		var metrics []mimirpb.PreallocTimeseries
 		if directTranslation {
-			metrics, err = otelMetricsToTimeseries(tenantID, addSuffixes, discardedDueToOtelParseError, logger, otlpReq.Metrics())
+			metrics, err = otelMetricsToTimeseries(tenantID, addSuffixes, promoteResourceAttributes, discardedDueToOtelParseError, logger, otlpReq.Metrics())
 			if err != nil {
 				return err
 			}
 		} else {
-			metrics, err = otelMetricsToTimeseriesOld(tenantID, addSuffixes, discardedDueToOtelParseError, logger, otlpReq.Metrics())
+			metrics, err = otelMetricsToTimeseriesOld(tenantID, addSuffixes, promoteResourceAttributes, discardedDueToOtelParseError, logger, otlpReq.Metrics())
 			if err != nil {
 				return err
 			}
@@ -190,6 +191,7 @@ func OTLPHandler(
 			"sample_count", sampleCount,
 			"histogram_count", histogramCount,
 			"exemplar_count", exemplarCount,
+			"promoted_resource_attributes", promoteResourceAttributes,
 		)
 
 		req.Timeseries = metrics
@@ -393,10 +395,11 @@ func otelMetricsToMetadata(addSuffixes bool, md pmetric.Metrics) []*mimirpb.Metr
 	return metadata
 }
 
-func otelMetricsToTimeseries(tenantID string, addSuffixes bool, discardedDueToOtelParseError *prometheus.CounterVec, logger log.Logger, md pmetric.Metrics) ([]mimirpb.PreallocTimeseries, error) {
+func otelMetricsToTimeseries(tenantID string, addSuffixes bool, promoteResourceAttributes []string, discardedDueToOtelParseError *prometheus.CounterVec, logger log.Logger, md pmetric.Metrics) ([]mimirpb.PreallocTimeseries, error) {
 	converter := otlp.NewMimirConverter()
 	errs := converter.FromMetrics(md, otlp.Settings{
-		AddMetricSuffixes: addSuffixes,
+		AddMetricSuffixes:         addSuffixes,
+		PromoteResourceAttributes: promoteResourceAttributes,
 	})
 	mimirTS := converter.TimeSeries()
 	if errs != nil {
@@ -419,10 +422,11 @@ func otelMetricsToTimeseries(tenantID string, addSuffixes bool, discardedDueToOt
 }
 
 // Old, less efficient, version of otelMetricsToTimeseries.
-func otelMetricsToTimeseriesOld(tenantID string, addSuffixes bool, discardedDueToOtelParseError *prometheus.CounterVec, logger log.Logger, md pmetric.Metrics) ([]mimirpb.PreallocTimeseries, error) {
+func otelMetricsToTimeseriesOld(tenantID string, addSuffixes bool, promoteResourceAttributes []string, discardedDueToOtelParseError *prometheus.CounterVec, logger log.Logger, md pmetric.Metrics) ([]mimirpb.PreallocTimeseries, error) {
 	converter := prometheusremotewrite.NewPrometheusConverter()
 	errs := converter.FromMetrics(md, prometheusremotewrite.Settings{
-		AddMetricSuffixes: addSuffixes,
+		AddMetricSuffixes:         addSuffixes,
+		PromoteResourceAttributes: promoteResourceAttributes,
 	})
 	promTS := converter.TimeSeries()
 	if errs != nil {
