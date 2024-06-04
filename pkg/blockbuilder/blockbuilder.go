@@ -2,9 +2,9 @@ package blockbuilder
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -172,8 +172,10 @@ func (b *BlockBuilder) stopping(_ error) error {
 func (b *BlockBuilder) running(ctx context.Context) error {
 	// Do initial consumption on start using current time as the point up to which we are consuming.
 	// To avoid small blocks at startup, we consume until the last hour boundary + buffer.
-	consumptionItvl := time.Hour
-	timeBuffer := 15 * time.Minute
+	//consumptionItvl := time.Hour
+	//timeBuffer := 15 * time.Minute
+	consumptionItvl := time.Minute
+	timeBuffer := 30 * time.Second
 	mark := time.Now().Truncate(consumptionItvl).Add(timeBuffer)
 	if mark.After(time.Now()) {
 		mark = mark.Add(-consumptionItvl)
@@ -253,7 +255,7 @@ func (b *BlockBuilder) nextConsumeCycle(ctx context.Context, mark time.Time) err
 
 	slices.Sort(parts)
 
-	// TODO(v): rebalancing can happen between the calls to consumePartitions; if that happens, the instace may loose
+	// TODO(v): rebalancing can happen between the calls to consumePartitions; if that happens, the instance may loose
 	// the ownership of some of its partitions
 	// TODO(v): test for this case
 	for _, part := range parts {
@@ -261,6 +263,10 @@ func (b *BlockBuilder) nextConsumeCycle(ctx context.Context, mark time.Time) err
 		if err != nil {
 			level.Error(b.logger).Log("msg", "failed to consume partition", "err", err, "part", part)
 		}
+		// Make sure to unblock rebalance of the group after the partition was consumed AND after we (potentially) commited
+		// this partition's offset to the group.
+		// TODO(v): test for this case
+		b.kafkaClient.AllowRebalance()
 	}
 
 	return nil
@@ -275,15 +281,7 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 	b.kafkaClient.ResumeFetchPartitions(tp)
 	defer b.kafkaClient.PauseFetchPartitions(tp)
 
-	// Make sure to unblock rebalance of the group after the very last poll AND after we (potentially) commited
-	// this partition's offset to the group.
-	// TODO(v): test for this case
-	defer b.kafkaClient.AllowRebalance()
-
-	level.Info(b.logger).Log(
-		"msg", "consume partition",
-		"part", part,
-	)
+	level.Info(b.logger).Log("msg", "consume partition", "part", part)
 
 	defer func(t time.Time) {
 		level.Info(b.logger).Log(
@@ -293,15 +291,19 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 		)
 	}(time.Now())
 
+	// TODO(v): refactor everything around BlocksStorageConfig
+	builderCfg := b.cfg.BlocksStorageConfig
+	builderCfg.TSDB.Dir = filepath.Join(b.cfg.BlocksStorageConfig.TSDB.Dir, fmt.Sprintf("p%d", part))
+	builder := newTSDBBuilder(b.logger, b.limits, builderCfg)
+
 	var lastOffset int64
 
 	// TODO(v): signal to bail out from the consume loop, otherwise a busy partition will starve the consumer
 	var (
 		consumptionItvl     = time.Hour        // TODO(codesome): get this from config
 		timeBuffer          = 15 * time.Minute // TODO(codesome): get this from config
-		checkpointOffset    = int64(-1)
+		checkpointRec       *kgo.Record
 		resetBlockBuilderAt time.Time
-		builder             *tsdbBuilder
 		currEnd, lastEnd    int64
 		done                bool
 	)
@@ -313,48 +315,44 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 		cancel()
 
 		if fetches.IsClientClosed() {
+			level.Warn(b.logger).Log("msg", "client closed")
 			return nil
 		}
 
 		fetches.EachError(func(_ string, part int32, err error) {
-			if !errors.Is(err, context.DeadlineExceeded) {
-				level.Error(b.logger).Log("msg", "failed to fetch records", "part", part, "err", err)
-			}
+			//if !errors.Is(err, context.DeadlineExceeded) {
+			level.Error(b.logger).Log("msg", "failed to fetch records", "part", part, "err", err)
+			//}
 		})
 
 		if fetches.Empty() {
+			level.Warn(b.logger).Log("msg", "fetches empty")
 			done = true
 		}
 
+		var procFetchesErr error
 		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
 			level.Info(b.logger).Log("msg", "consumed", "part", ftp.Partition, "hi", ftp.HighWatermark, "lo", ftp.LogStartOffset, "batch_size", len(ftp.Records))
-
-			if ftp.Err != nil {
-				level.Error(b.logger).Log("msg", "failed to fetch records", "part", ftp.Partition, "err", ftp.Err)
-				// TODO(codesome): add metric?
-				return
-			}
 
 			for _, rec := range ftp.Records {
 				// When BB is first deployed or if it is lagging behind, then it might consuming data from too much
 				// in the past. In which case if we try to consume all at once, it can overwhelm the system.
 				// So we break this into multiple block building cycles by resetting the block builder at intervals.
 				// TODO(codesome): the logic for this below is broken. Fix it. How can we determine the block ends when we are catching up?
-				if builder != nil && rec.Timestamp.After(resetBlockBuilderAt) {
-					if err := builder.compactAndRemoveDBs(ctx); err != nil {
-						level.Error(b.logger).Log("msg", "failed to compact and remove dbs", "part", part, "err", err)
-						// TODO(codesome): return err?
-						// TODO(codesome): add metric
-					}
-					builder = nil
-				}
-				if builder == nil {
-					builder = newTSDBBuilder(b.logger, b.limits, b.cfg.BlocksStorageConfig)
+				if resetBlockBuilderAt.IsZero() {
 					resetBlockBuilderAt = rec.Timestamp.Truncate(consumptionItvl).Add(consumptionItvl + timeBuffer)
 
 					// TODO(codesome): verify. this can be wrong.
 					currEnd = rec.Timestamp.Truncate(consumptionItvl).UnixMilli()
 					lastEnd = currEnd - consumptionItvl.Milliseconds()
+				} else if rec.Timestamp.After(resetBlockBuilderAt) {
+					if err := builder.compactAndRemoveDBs(ctx); err != nil {
+						// TODO(codesome): add metric
+						procFetchesErr = fmt.Errorf("compact and clean dbs: %w", err)
+						return
+					}
+					// Zeroing the resetBlockBuilderAt marker to re-populate it on the next iteration.
+					resetBlockBuilderAt = time.Time{}
 				}
 
 				// TODO(v): the allSamplesProcessed logic isn't seem right.
@@ -363,8 +361,8 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 				// 2. process was restarted, the client fetched last commited offset for the group+partition and started consuming from this (old) offset
 				recordProcessedBefore := false // TODO(codesome): get this from checkpoint
 				allSamplesProcessed, err := builder.process(ctx, rec, lastEnd, currEnd, recordProcessedBefore)
-				if !allSamplesProcessed && checkpointOffset < 0 {
-					checkpointOffset = rec.Offset
+				if !allSamplesProcessed && checkpointRec == nil {
+					checkpointRec = rec
 				}
 				if err != nil {
 					level.Error(b.logger).Log("msg", "failed to process record", "part", part, "key", string(rec.Key), "err", err)
@@ -381,52 +379,51 @@ func (b *BlockBuilder) consumePartitions(ctx context.Context, part int32, mark t
 				}
 			}
 		})
-
-		// After the rebalance, if another instance took over the partition, the next poll
-		// will return empty fetches, and the loop will bail out.
-		// TODO(v): test for this case
-		b.kafkaClient.AllowRebalance()
+		if procFetchesErr != nil {
+			return procFetchesErr
+		}
 	}
 
-	if builder != nil {
-		if err := builder.compactAndRemoveDBs(ctx); err != nil {
-			// TODO(codesome): add metric
-			return err
-		}
+	if err := builder.compactAndRemoveDBs(ctx); err != nil {
+		// TODO(codesome): add metric
+		return err
 	}
 
 	// TODO(codesome): store the lastOffset and currEnd as a metadata in the checkpoint
 	_ = lastOffset // to avoid unused error. TODO: remove this once used
-	if checkpointOffset > 0 {
-		return b.commitOffset(ctx, part, checkpointOffset)
+	if checkpointRec != nil {
+		return b.commitOffset(ctx, checkpointRec)
 	}
 	return nil
 }
 
-func (b *BlockBuilder) commitOffset(ctx context.Context, part int32, offset int64) (returnErr error) {
+func (b *BlockBuilder) commitOffset(ctx context.Context, checkpointRec *kgo.Record) (err error) {
 	defer func() {
-		if returnErr != nil {
-			level.Error(b.logger).Log("msg", "failed to commit offset to Kafka", "err", returnErr, "partition", part, "offset", offset)
+		if err != nil {
 			// TODO(codesome): add metric
 		}
 	}()
 
-	toCommit := kadm.Offsets{}
-	toCommit.AddOffset(b.cfg.Kafka.Topic, part, offset, -1)
+	return b.kafkaClient.CommitRecords(ctx, checkpointRec)
 
-	committed, err := kadm.NewClient(b.kafkaClient).CommitOffsets(ctx, b.cfg.Kafka.ConsumerGroup, toCommit)
-	if err != nil {
-		return err
-	} else if !committed.Ok() {
-		return committed.Error()
-	}
+	/*
+		toCommit := kadm.Offsets{}
+		toCommit.AddOffset(b.cfg.Kafka.Topic, part, offset, -1)
 
-	committedOffset, _ := committed.Lookup(b.cfg.Kafka.Topic, part)
-	level.Debug(b.logger).Log("msg", "offset successfully committed to Kafka", "offset", committedOffset.At)
-	// TODO(codesome): add this metric
-	// r.lastCommittedOffset.Set(float64(committedOffset.At))
+		committed, err := kadm.NewClient(b.kafkaClient).CommitOffsets(ctx, b.cfg.Kafka.ConsumerGroup, toCommit)
+		if err != nil {
+			return err
+		} else if !committed.Ok() {
+			return committed.Error()
+		}
 
-	return nil
+		committedOffset, _ := committed.Lookup(b.cfg.Kafka.Topic, part)
+		level.Debug(b.logger).Log("msg", "offset successfully committed to Kafka", "offset", committedOffset.At)
+		// TODO(codesome): add this metric
+		// r.lastCommittedOffset.Set(float64(committedOffset.At))
+
+		return nil
+	*/
 }
 
 type Config struct {
