@@ -4333,10 +4333,11 @@
           "kind": "field",
           "name": "promote_otel_resource_attributes",
           "required": false,
-          "desc": "",
+          "desc": "Eventual OTel resource attributes to promote to labels.",
           "fieldValue": null,
-          "fieldDefaultValue": [],
-          "fieldType": "list of strings",
+          "fieldDefaultValue": "",
+          "fieldFlag": "distributor.promote-otel-resource-attributes",
+          "fieldType": "string",
           "fieldCategory": "experimental"
         }
       ],
