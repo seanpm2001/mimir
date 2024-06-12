@@ -79,8 +79,8 @@ type PartitionReader struct {
 
 	client *kgo.Client
 
-	consumer recordConsumer
-	metrics  readerMetrics
+	newConsumer consumerFactory
+	metrics     readerMetrics
 
 	committer *partitionCommitter
 
@@ -93,16 +93,39 @@ type PartitionReader struct {
 	reg    prometheus.Registerer
 }
 
-func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instanceID string, pusher Pusher, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
-	consumer := newPusherConsumer(pusher, util_log.NewSampler(kafkaCfg.FallbackClientErrorSampleRate), reg, logger)
-	return newPartitionReader(kafkaCfg, partitionID, instanceID, consumer, logger, reg)
+type consumerFactoryFunc func() consumerCloser
+
+func (c consumerFactoryFunc) consumer() consumerCloser {
+	return c()
 }
 
-func newPartitionReader(kafkaCfg KafkaConfig, partitionID int32, instanceID string, consumer recordConsumer, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
+func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instanceID string, pusher Pusher, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
+	consumerProto := newPusherConsumerPrototype(util_log.NewSampler(kafkaCfg.FallbackClientErrorSampleRate), reg, logger)
+	numTimeSeriesPerFlush := promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+		Name:                        "cortex_ingester_pusher_num_timeseries_per_flush",
+		Help:                        "Number of time series per flush",
+		NativeHistogramBucketFactor: 1.1,
+	})
+	factory := consumerFactoryFunc(func() consumerCloser {
+		return newPusherConsumer(newMultiTenantPusher(numTimeSeriesPerFlush, pusher, kafkaCfg.ReplayShards, kafkaCfg.BatchSize), consumerProto)
+	})
+	return newPartitionReader(kafkaCfg, partitionID, instanceID, factory, logger, reg)
+}
+
+type consumerFactory interface {
+	consumer() consumerCloser
+}
+
+type consumerCloser interface {
+	recordConsumer
+	Close(context.Context) []error
+}
+
+func newPartitionReader(kafkaCfg KafkaConfig, partitionID int32, instanceID string, consumer consumerFactory, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
 	r := &PartitionReader{
 		kafkaCfg:              kafkaCfg,
 		partitionID:           partitionID,
-		consumer:              consumer,
+		newConsumer:           consumer,
 		consumerGroup:         kafkaCfg.GetConsumerGroup(instanceID, partitionID),
 		metrics:               newReaderMetrics(partitionID, reg),
 		consumedOffsetWatcher: newPartitionOffsetWatcher(),
@@ -281,7 +304,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		MaxRetries: 0, // Retry forever (unless context is canceled / deadline exceeded).
 	})
 
-	fetcher, err := newConcurrentFetchers(ctx, r.client, r.logger, r.reg, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, &r.metrics)
+	fetcher, err := newConcurrentFetchers(ctx, r.client, r.logger, r.reg, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, r.kafkaCfg.RecordsPerFetch, &r.metrics)
 	if err != nil {
 		return 0, errors.Wrap(err, "creating fetcher")
 	}
@@ -439,14 +462,17 @@ func (r *PartitionReader) consumeFetches(ctx context.Context, fetches kgo.Fetche
 
 	for boff.Ongoing() {
 		consumeStart := time.Now()
-		err := r.consumer.consume(ctx, records)
+		consumer := r.newConsumer.consumer()
+		err := consumer.consume(ctx, records)
+		err2 := consumer.Close(ctx)
 		r.metrics.consumeLatency.Observe(time.Since(consumeStart).Seconds())
-		if err == nil {
+		if err == nil && len(err2) == 0 {
 			break
 		}
 		level.Error(r.logger).Log(
 			"msg", "encountered error while ingesting data from Kafka; will retry",
 			"err", err,
+			"err2", fmt.Sprint(err2),
 			"record_min_offset", minOffset,
 			"record_max_offset", maxOffset,
 			"num_retries", boff.NumRetries(),
@@ -733,20 +759,22 @@ type concurrentFetchers struct {
 	nextFetchOffset        int64
 	fetchesCompressedBytes prometheus.Counter
 
-	orderedFetches chan kgo.FetchPartition
+	orderedFetches  chan kgo.FetchPartition
+	recordsPerFetch int
 }
 
 // newConcurrentFetchers creates a new concurrentFetchers. startOffset can be kafkaOffsetStart, kafkaOffsetEnd or a specific offset.
-func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.Logger, reg prometheus.Registerer, topic string, partition int32, startOffset int64, concurrency int, metrics *readerMetrics) (*concurrentFetchers, error) {
+func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.Logger, reg prometheus.Registerer, topic string, partition int32, startOffset int64, concurrency int, recordsPerFetch int, metrics *readerMetrics) (*concurrentFetchers, error) {
 	f := &concurrentFetchers{
-		client:         client,
-		logger:         logger,
-		concurrency:    concurrency,
-		topicName:      topic,
-		partitionID:    partition,
-		metrics:        metrics,
-		tracer:         kotel.NewTracer(kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))),
-		orderedFetches: make(chan kgo.FetchPartition, 1),
+		client:          client,
+		logger:          logger,
+		concurrency:     concurrency,
+		topicName:       topic,
+		partitionID:     partition,
+		metrics:         metrics,
+		recordsPerFetch: recordsPerFetch,
+		tracer:          kotel.NewTracer(kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))),
+		orderedFetches:  make(chan kgo.FetchPartition, 1),
 		fetchesCompressedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ingest_storage_reader_fetches_compressed_bytes_total",
 			Help: "Total number of compressed bytes fetched from Kafka by the consumer.",
@@ -775,7 +803,6 @@ func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.L
 	return f, nil
 }
 
-// TODO dimitarvdimitrov rename and maybe restructure how it's used in processNextFetchesUntilMaxLagHonored
 func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetches) {
 	defer func(start time.Time) {
 		r.metrics.fetchWaitDuration.Observe(time.Since(start).Seconds())
@@ -788,6 +815,7 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 	case <-ctx.Done():
 		return kgo.Fetches{}
 	case f := <-r.orderedFetches:
+		// TODO dimitarvdimitrov ignore records that we've already returned
 		r.logger.Log("msg", "received ordered fetch", "num_records", len(f.Records))
 		f.EachRecord(func(record *kgo.Record) {
 			r.tracer.OnFetchRecordUnbuffered(record, true)
@@ -834,7 +862,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant) kgo.F
 		}
 	}
 	rawPartitionResp := resp.Topics[0].Partitions[0]
-	r.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // TODO dimitarvdimitrov this doesn't include overhead in the response - investigate
+	r.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
 	level.Info(r.logger).Log(
 		"msg", "fetched records",
@@ -924,7 +952,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 
 	var (
-		nextFetch  = fetchWantFrom(startOffset)
+		nextFetch  = fetchWantFrom(startOffset, r.recordsPerFetch)
 		nextResult chan kgo.FetchPartition
 		results    = list.New()
 	)
@@ -939,7 +967,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				nextResult = results.Front().Value.(chan kgo.FetchPartition)
 				results.Remove(results.Front())
 			}
-			nextFetch = nextFetchWant(nextFetch)
+			nextFetch = nextFetchWant(nextFetch, r.recordsPerFetch)
 		case result, moreLeft := <-nextResult:
 			if !moreLeft {
 				if results.Len() > 0 {
@@ -959,15 +987,14 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 }
 
-func nextFetchWant(fetch fetchWant) fetchWant {
-	return fetchWantFrom(fetch.endOffset)
+func nextFetchWant(fetch fetchWant, recordsPerFetch int) fetchWant {
+	return fetchWantFrom(fetch.endOffset, recordsPerFetch)
 }
 
-func fetchWantFrom(offset int64) fetchWant {
-	const recordsPerFetch = 128
+func fetchWantFrom(offset int64, recordsPerFetch int) fetchWant {
 	return fetchWant{
 		startOffset: offset,
-		endOffset:   offset + recordsPerFetch,
+		endOffset:   offset + int64(recordsPerFetch),
 		result:      make(chan kgo.FetchPartition, 1),
 	}
 }

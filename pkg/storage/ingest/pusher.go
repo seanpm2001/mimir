@@ -6,15 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/cancellation"
 	"github.com/grafana/dskit/middleware"
+	"github.com/grafana/dskit/multierror"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	util_log "github.com/grafana/mimir/pkg/util/log"
@@ -25,9 +28,7 @@ type Pusher interface {
 	PushToStorage(context.Context, *mimirpb.WriteRequest) error
 }
 
-type pusherConsumer struct {
-	pusher Pusher
-
+type pusherConsumerPrototype struct {
 	processingTimeSeconds prometheus.Observer
 	clientErrRequests     prometheus.Counter
 	serverErrRequests     prometheus.Counter
@@ -45,14 +46,45 @@ type parsedRecord struct {
 	err      error
 }
 
-func newPusherConsumer(p Pusher, fallbackClientErrSampler *util_log.Sampler, reg prometheus.Registerer, l log.Logger) *pusherConsumer {
+type PusherCloser interface {
+	Pusher
+	Close() []error
+}
+
+type pusherConsumer struct {
+	pusherConsumerPrototype
+	pusher PusherCloser
+}
+
+func (c pusherConsumer) Close(ctx context.Context) []error {
+	spanLog := spanlogger.FromContext(ctx, log.NewNopLogger())
+	errs := c.pusher.Close()
+	for eIdx := 0; eIdx < len(errs); eIdx++ {
+		err := errs[eIdx]
+		isServerErr := c.handlePushErr(ctx, "TODO", err, spanLog)
+		if !isServerErr {
+			errs[len(errs)-1], errs[eIdx] = errs[eIdx], errs[len(errs)-1]
+			errs = errs[:len(errs)-1]
+			eIdx--
+		}
+	}
+	return errs
+}
+
+func newPusherConsumer(p PusherCloser, proto pusherConsumerPrototype) *pusherConsumer {
+	return &pusherConsumer{
+		pusher:                  p,
+		pusherConsumerPrototype: proto,
+	}
+}
+
+func newPusherConsumerPrototype(fallbackClientErrSampler *util_log.Sampler, reg prometheus.Registerer, l log.Logger) pusherConsumerPrototype {
 	errRequestsCounter := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "cortex_ingest_storage_reader_records_failed_total",
 		Help: "Number of records (write requests) which caused errors while processing. Client errors are errors such as tenant limits and samples out of bounds. Server errors indicate internal recoverable errors.",
 	}, []string{"cause"})
 
-	return &pusherConsumer{
-		pusher:                   p,
+	return pusherConsumerPrototype{
 		logger:                   l,
 		fallbackClientErrSampler: fallbackClientErrSampler,
 		processingTimeSeconds: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
@@ -110,29 +142,40 @@ func (c pusherConsumer) pushToStorage(ctx context.Context, tenantID string, req 
 	ctx = user.InjectOrgID(ctx, tenantID)
 	err := c.pusher.PushToStorage(ctx, req)
 
+	// TODO dimitarvdimitrov processing time is flawed because it's only counting enqueuing time, not processing time.
 	c.processingTimeSeconds.Observe(time.Since(processingStart).Seconds())
 	c.totalRequests.Inc()
 
-	if err != nil {
-		// Only return non-client errors; these will stop the processing of the current Kafka fetches and retry (possibly).
-		if !mimirpb.IsClientError(err) {
-			c.serverErrRequests.Inc()
-			return spanLog.Error(err)
-		}
-
-		c.clientErrRequests.Inc()
-
-		// The error could be sampled or marked to be skipped in logs, so we check whether it should be
-		// logged before doing it.
-		if keep, reason := c.shouldLogClientError(ctx, err); keep {
-			if reason != "" {
-				err = fmt.Errorf("%w (%s)", err, reason)
-			}
-			// This error message is consistent with error message in Prometheus remote-write and OTLP handlers in distributors.
-			level.Warn(spanLog).Log("msg", "detected a client error while ingesting write request (the request may have been partially ingested)", "user", tenantID, "insight", true, "err", err)
-		}
+	isServerErr := c.handlePushErr(ctx, tenantID, err, spanLog)
+	if isServerErr {
+		return err
 	}
 	return nil
+}
+
+func (c pusherConsumer) handlePushErr(ctx context.Context, tenantID string, err error, spanLog *spanlogger.SpanLogger) bool {
+	if err == nil {
+		return false
+	}
+	// Only return non-client errors; these will stop the processing of the current Kafka fetches and retry (possibly).
+	if !mimirpb.IsClientError(err) {
+		c.serverErrRequests.Inc()
+		_ = spanLog.Error(err)
+		return true
+	}
+
+	c.clientErrRequests.Inc()
+
+	// The error could be sampled or marked to be skipped in logs, so we check whether it should be
+	// logged before doing it.
+	if keep, reason := c.shouldLogClientError(ctx, err); keep {
+		if reason != "" {
+			err = fmt.Errorf("%w (%s)", err, reason)
+		}
+		// This error message is consistent with error message in Prometheus remote-write and OTLP handlers in distributors.
+		level.Warn(spanLog).Log("msg", "detected a client error while ingesting write request (the request may have been partially ingested)", "user", tenantID, "insight", true, "err", err)
+	}
+	return false
 }
 
 // shouldLogClientError returns whether err should be logged.
@@ -180,4 +223,149 @@ func (c pusherConsumer) unmarshalRequests(ctx context.Context, records []record,
 		case recC <- pRecord:
 		}
 	}
+}
+
+type multiTenantPusher struct {
+	pushers               map[string]*shardingPusher
+	upstreamPusher        Pusher
+	numShards             int
+	batchSize             int
+	numTimeSeriesPerFlush prometheus.Histogram
+}
+
+func (c multiTenantPusher) PushToStorage(ctx context.Context, request *mimirpb.WriteRequest) error {
+	user, _ := user.ExtractOrgID(ctx)
+	return c.pusher(user).PushToStorage(ctx, request)
+}
+
+func newMultiTenantPusher(numTimeSeriesPerFlush prometheus.Histogram, upstream Pusher, numShards int, batchSize int) *multiTenantPusher {
+	return &multiTenantPusher{
+		pushers:               make(map[string]*shardingPusher),
+		upstreamPusher:        upstream,
+		numShards:             numShards,
+		batchSize:             batchSize,
+		numTimeSeriesPerFlush: numTimeSeriesPerFlush,
+	}
+}
+
+func (c multiTenantPusher) pusher(userID string) *shardingPusher {
+	if p := c.pushers[userID]; p != nil {
+		return p
+	}
+	p := newShardingPusher(c.numTimeSeriesPerFlush, c.numShards, c.batchSize, c.upstreamPusher) // TODO dimitarvdimitrov this ok or do we need to inject a factory here too?
+	c.pushers[userID] = p
+	return p
+}
+
+func (c multiTenantPusher) Close() []error {
+	var errs multierror.MultiError
+	for _, p := range c.pushers {
+		errs.Add(p.close())
+	}
+	clear(c.pushers)
+	return errs
+}
+
+type shardedPush struct {
+	mimirpb.PreallocTimeseries
+	context.Context
+}
+
+type shardingPusher struct {
+	numShards             int
+	shards                []chan shardedPush
+	upstream              Pusher
+	wg                    *sync.WaitGroup
+	errs                  chan error
+	batchSize             int
+	numTimeSeriesPerFlush prometheus.Histogram
+}
+
+func newShardingPusher(numTimeSeriesPerFlush prometheus.Histogram, numShards int, batchSize int, upstream Pusher) *shardingPusher {
+	pusher := &shardingPusher{
+		numShards:             numShards,
+		upstream:              upstream,
+		numTimeSeriesPerFlush: numTimeSeriesPerFlush,
+		batchSize:             batchSize,
+		wg:                    &sync.WaitGroup{},
+		errs:                  make(chan error, numShards),
+	}
+	shards := make([]chan shardedPush, numShards)
+	pusher.wg.Add(numShards)
+	for i := range shards {
+		shards[i] = make(chan shardedPush)
+		go pusher.runShard(shards[i])
+	}
+	go func() {
+		pusher.wg.Wait()
+		close(pusher.errs)
+	}()
+
+	pusher.shards = shards
+	return pusher
+}
+
+// TODO dimitarvdimitrov consider having this long-lived and not closing it.
+func (p *shardingPusher) PushToStorage(ctx context.Context, request *mimirpb.WriteRequest) error {
+	var (
+		builder         labels.ScratchBuilder
+		nonCopiedLabels labels.Labels
+		errs            multierror.MultiError
+	)
+	for _, ts := range request.Timeseries {
+		mimirpb.FromLabelAdaptersOverwriteLabels(&builder, ts.Labels, &nonCopiedLabels)
+		shard := nonCopiedLabels.Hash() % uint64(p.numShards)
+
+	tryPush:
+		for {
+			select {
+			case p.shards[shard] <- shardedPush{ts, ctx}:
+				break tryPush
+			case err := <-p.errs:
+				errs.Add(err)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return errs.Err()
+}
+
+// TODO dimitarvdimitrov support metadata
+func (p *shardingPusher) runShard(timeseries chan shardedPush) {
+	defer p.wg.Done()
+	timeseriesBatch := make([]mimirpb.PreallocTimeseries, 0, p.batchSize)
+
+	flush := func(ctx context.Context) {
+		p.numTimeSeriesPerFlush.Observe(float64(len(timeseriesBatch)))
+		err := p.upstream.PushToStorage(ctx, &mimirpb.WriteRequest{Timeseries: timeseriesBatch})
+		if err != nil {
+			p.errs <- err
+		}
+		timeseriesBatch = timeseriesBatch[:0]
+	}
+
+	var lastCtx context.Context
+	for ts := range timeseries {
+		timeseriesBatch = append(timeseriesBatch, ts.PreallocTimeseries)
+		if len(timeseriesBatch) == p.batchSize {
+			// TODO dimitarvdimitrov this breaks tracing because we might not use the spans from all of the requests
+			flush(ts.Context)
+		}
+		lastCtx = ts.Context
+	}
+	if len(timeseriesBatch) > 0 {
+		flush(lastCtx)
+	}
+}
+
+func (p *shardingPusher) close() error {
+	for _, shard := range p.shards {
+		close(shard)
+	}
+	var errs multierror.MultiError
+	for err := range p.errs {
+		errs.Add(err)
+	}
+	return errs.Err()
 }
