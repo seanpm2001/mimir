@@ -104,8 +104,8 @@ func TestOTelMetricsToTimeSeries(t *testing.T) {
 
 	testCases := []struct {
 		name                      string
-		expectedLabels            []mimirpb.LabelAdapter
 		promoteResourceAttributes []string
+		expectedLabels            []mimirpb.LabelAdapter
 	}{
 		{
 			name:                      "Successful conversion without resource attribute promotion",

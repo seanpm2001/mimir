@@ -67,14 +67,14 @@ type bucketBoundsData struct {
 	bound float64
 }
 
-// byBucketBoundsData enables the usage of sort.Sort() with a slice of bucket bounds
+// byBucketBoundsData enables the usage of sort.Sort() with a slice of bucket bounds.
 type byBucketBoundsData []bucketBoundsData
 
 func (m byBucketBoundsData) Len() int           { return len(m) }
 func (m byBucketBoundsData) Less(i, j int) bool { return m[i].bound < m[j].bound }
 func (m byBucketBoundsData) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
 
-// ByLabelName enables the usage of sort.Sort() with a slice of labels
+// ByLabelName enables the usage of sort.Sort() with a slice of labels.
 type ByLabelName []mimirpb.LabelAdapter
 
 func (a ByLabelName) Len() int           { return len(a) }
@@ -125,12 +125,11 @@ func createAttributes(resource pcommon.Resource, attributes pcommon.Map, setting
 	instance, haveInstanceID := resourceAttrs.Get(conventions.AttributeServiceInstanceID)
 
 	promotedAttrs := make([]mimirpb.LabelAdapter, 0, len(settings.PromoteResourceAttributes))
-	resourceAttrs.Range(func(key string, value pcommon.Value) bool {
-		if slices.Contains(settings.PromoteResourceAttributes, key) {
-			promotedAttrs = append(promotedAttrs, mimirpb.LabelAdapter{Name: key, Value: value.AsString()})
+	for _, name := range settings.PromoteResourceAttributes {
+		if value, ok := resourceAttrs.Get(name); ok {
+			promotedAttrs = append(promotedAttrs, mimirpb.LabelAdapter{Name: name, Value: value.AsString()})
 		}
-		return true
-	})
+	}
 	sort.Stable(ByLabelName(promotedAttrs))
 
 	// Calculate the maximum possible number of labels we could return so we can preallocate l
