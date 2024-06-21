@@ -35,6 +35,7 @@ import (
 	apierror "github.com/grafana/mimir/pkg/api/error"
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/querier/api"
+	"github.com/grafana/mimir/pkg/streamingpromql/compat"
 	"github.com/grafana/mimir/pkg/util"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
@@ -117,7 +118,7 @@ type MetricsQueryRequest interface {
 	// These hints can be used to optimize the query execution.
 	GetHints() *Hints
 	// WithID clones the current request with the provided ID.
-	WithID(id int64) MetricsQueryRequest
+	WithID(id int64) (MetricsQueryRequest, error)
 	// WithStartEnd clone the current request with different start and end timestamp.
 	// Implementations must ensure minT and maxT are recalculated when the start and end timestamp change.
 	WithStartEnd(startTime int64, endTime int64) (MetricsQueryRequest, error)
@@ -125,14 +126,14 @@ type MetricsQueryRequest interface {
 	// Implementations must ensure minT and maxT are recalculated when the query changes.
 	WithQuery(string) (MetricsQueryRequest, error)
 	// WithHeaders clones the current request with different headers.
-	WithHeaders([]*PrometheusHeader) MetricsQueryRequest
+	WithHeaders([]*PrometheusHeader) (MetricsQueryRequest, error)
 	// WithExpr clones the current `PrometheusRangeQueryRequest` with a new query expression.
 	// Implementations must ensure minT and maxT are recalculated when the query changes.
-	WithExpr(parser.Expr) MetricsQueryRequest
+	WithExpr(parser.Expr) (MetricsQueryRequest, error)
 	// WithTotalQueriesHint adds the number of total queries to this request's Hints.
-	WithTotalQueriesHint(int32) MetricsQueryRequest
+	WithTotalQueriesHint(int32) (MetricsQueryRequest, error)
 	// WithEstimatedSeriesCountHint WithEstimatedCardinalityHint adds a cardinality estimate to this request's Hints.
-	WithEstimatedSeriesCountHint(uint64) MetricsQueryRequest
+	WithEstimatedSeriesCountHint(uint64) (MetricsQueryRequest, error)
 	// AddSpanTags writes information about this request to an OpenTracing span
 	AddSpanTags(opentracing.Span)
 }
@@ -579,6 +580,15 @@ func (c prometheusCodec) EncodeMetricsQueryRequest(ctx context.Context, r Metric
 		req.Header.Add(api.ReadConsistencyHeader, consistency)
 	}
 
+	for _, h := range r.GetHeaders() {
+		if h.Name == compat.ForceFallbackHeaderName {
+			for _, v := range h.Values {
+				// There should only be one value, but add all of them for completeness.
+				req.Header.Add(compat.ForceFallbackHeaderName, v)
+			}
+		}
+	}
+
 	return req.WithContext(ctx), nil
 }
 
@@ -791,7 +801,7 @@ func matrixMerge(resps []*PrometheusResponse) []SampleStream {
 			continue
 		}
 		for _, stream := range resp.Data.Result {
-			metric := mimirpb.FromLabelAdaptersToLabels(stream.Labels).String()
+			metric := mimirpb.FromLabelAdaptersToKeyString(stream.Labels)
 			existing, ok := output[metric]
 			if !ok {
 				existing = &SampleStream{
