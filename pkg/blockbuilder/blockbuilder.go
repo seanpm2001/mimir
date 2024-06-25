@@ -302,7 +302,7 @@ func (b *BlockBuilder) NextConsumeCycle(ctx context.Context, cycleEnd time.Time)
 		// We look at the commit offset timestamp to determine how far behind we are lagging
 		// relative to the cycleEnd. We will consume the partition in parts accordingly.
 		offset := pl.Commit
-		level.Debug(b.logger).Log("part", offset.Partition, "offset", offset.At, "meta", offset.Metadata)
+		level.Debug(b.logger).Log("partition lag", pl.Lag, "part", offset.Partition, "offset", offset.At, "meta", offset.Metadata)
 		commitRecTs, seenTillTs, lastBlockEnd, err := unmarshallCommitMeta(offset.Metadata)
 		if err != nil {
 			// If there is an error in unmarshalling the metadata, treat it as if
@@ -361,6 +361,8 @@ func (b *BlockBuilder) NextConsumeCycle(ctx context.Context, cycleEnd time.Time)
 		// We iterate through all the cycleEnds starting from the first one after commit until the cycleEnd.
 		cycleEndStartAt := commitRecTime.Truncate(b.cfg.ConsumeInterval).Add(b.cfg.ConsumeInterval + b.cfg.ConsumeIntervalBuffer)
 		for ce := cycleEndStartAt; cycleEnd.Sub(ce) >= 0; ce = ce.Add(b.cfg.ConsumeInterval) {
+			level.Debug(b.logger).Log("msg", "partition is lagging", "part", pl.Partition, "cycle_end_part", ce, "cycle_end", cycleEnd)
+
 			// Instead of looking for the commit metadata for each iteration, we use the data returned by consumePartition
 			// in the next iteration.
 			lag, seenTillTs, lastBlockEnd, err = b.consumePartition(ctx, pl.Partition, lag, seenTillTs, lastBlockEnd, ce)
@@ -461,7 +463,7 @@ func (b *BlockBuilder) consumePartition(
 				firstRec = rec
 			}
 
-			level.Debug(b.logger).Log("msg", "process record", "offset", rec.Offset, "rec", rec.Timestamp, "last_bmax", lastBlockMax, "bmax", blockMax)
+			level.Debug(b.logger).Log("msg", "process record", "offset", rec.Offset, "rec", rec.Timestamp, "rects", rec.Timestamp.UnixMilli(), "last_bmax", lastBlockMax, "bmax", blockMax)
 
 			// Stop consuming after we reached the cycleEnd marker.
 			// NOTE: the timestamp of the record is when the record was produced relative to distributor's time.
@@ -592,7 +594,7 @@ func commitRecord(ctx context.Context, l log.Logger, kc *kgo.Client, topic strin
 				}
 			}
 		}
-		level.Info(l).Log("commit request", fmt.Sprintf("%+v", req))
+		level.Debug(l).Log("commit req", fmt.Sprintf("%+v", req), "meta", meta)
 		return nil
 	})
 

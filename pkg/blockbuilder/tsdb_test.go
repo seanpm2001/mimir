@@ -55,10 +55,32 @@ func floatSample(ts int64) []mimirpb.Sample {
 	return []mimirpb.Sample{{TimestampMs: ts, Value: float64(ts)}}
 }
 
+func filterSamples(s []mimirpb.Sample, maxTime time.Time) []mimirpb.Sample {
+	maxT := maxTime.UnixMilli()
+	var res []mimirpb.Sample
+	for _, sample := range s {
+		if sample.TimestampMs < maxT {
+			res = append(res, sample)
+		}
+	}
+	return res
+}
+
 func histogramSample(ts int64) []mimirpb.Histogram {
 	return []mimirpb.Histogram{
 		mimirpb.FromHistogramToHistogramProto(ts, test.GenerateTestHistogram(int(ts))),
 	}
+}
+
+func filterHistogramSamples(s []mimirpb.Histogram, maxTime time.Time) []mimirpb.Histogram {
+	maxT := maxTime.UnixMilli()
+	var res []mimirpb.Histogram
+	for _, sample := range s {
+		if sample.Timestamp < maxT {
+			res = append(res, sample)
+		}
+	}
+	return res
 }
 
 func TestTSDBBuilder(t *testing.T) {
