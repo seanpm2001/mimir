@@ -61,6 +61,7 @@ type Config struct {
 	SplitQueriesByInterval   time.Duration `yaml:"split_queries_by_interval" category:"advanced"`
 	ResultsCacheConfig       `yaml:"results_cache"`
 	CacheResults             bool          `yaml:"cache_results"`
+	CacheErrors              bool          `yaml:"cache_errors" category:"experimental"`
 	MaxRetries               int           `yaml:"max_retries" category:"advanced"`
 	NotRunningTimeout        time.Duration `yaml:"not_running_timeout" category:"advanced"`
 	ShardedQueries           bool          `yaml:"parallelize_shardable_queries"`
@@ -319,6 +320,26 @@ func newQueryMiddlewares(
 		newInstrumentMiddleware("step_align", metrics),
 		newStepAlignMiddleware(limits, log, registerer),
 	)
+
+	if cfg.CacheResults && cfg.CacheErrors {
+		// TODO: This needs to go before the split-and-cache middleware because otherwise only a single
+		//  shard or split will result in an error that can be cached: the rest will be cancelled so that
+		//  most of them will attempt to do work and race against getting an error from cache. This will
+		//  reduce the effectiveness of the cache.
+
+		// TODO:
+		queryRangeMiddleware = append(
+			queryRangeMiddleware,
+			newInstrumentMiddleware("error_caching", metrics),
+			newErrorCachingMiddleware(cacheClient, limits, 5*time.Minute, log, registerer),
+		)
+
+		queryInstantMiddleware = append(
+			queryInstantMiddleware,
+			newInstrumentMiddleware("error_caching", metrics),
+			newErrorCachingMiddleware(cacheClient, limits, 5*time.Minute, log, registerer),
+		)
+	}
 
 	// Inject the middleware to split requests by interval + results cache (if at least one of the two is enabled).
 	if cfg.SplitQueriesByInterval > 0 || cfg.CacheResults {
