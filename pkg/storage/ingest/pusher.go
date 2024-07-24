@@ -238,6 +238,7 @@ func (c multiTenantPusher) PushToStorage(ctx context.Context, request *mimirpb.W
 	return c.pusher(user).PushToStorage(ctx, request)
 }
 
+// TODO dimitarvdimitrov rename because this is multi-tenant sharding pusher
 func newMultiTenantPusher(numTimeSeriesPerFlush prometheus.Histogram, upstream Pusher, numShards int, batchSize int) *multiTenantPusher {
 	return &multiTenantPusher{
 		pushers:               make(map[string]*shardingPusher),

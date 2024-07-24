@@ -15,8 +15,10 @@ import (
 	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/tenant"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc/codes"
@@ -401,4 +403,219 @@ func ingesterError(cause mimirpb.ErrorCause, statusCode codes.Code, message stri
 		panic(err)
 	}
 	return statWithDetails.Err()
+}
+
+type mockPusher struct {
+	mock.Mock
+}
+
+func (m mockPusher) PushToStorage(ctx context.Context, request *mimirpb.WriteRequest) error {
+	args := m.Called(ctx, request)
+	return args.Error(0)
+}
+
+func TestShardingPusher(t *testing.T) {
+	noopHistogram := promauto.With(prometheus.NewRegistry()).NewHistogram(prometheus.HistogramOpts{Name: "noop", NativeHistogramBucketFactor: 1.1})
+
+	testCases := map[string]struct {
+		shardCount   int
+		batchSize    int
+		requests     []*mimirpb.WriteRequest
+		expectedErrs []error
+
+		expectedUpstreamPushes []*mimirpb.WriteRequest
+		upstreamPushErrs       []error
+		expectedCloseErr       error
+	}{
+		"push to a single shard and fill exactly capacity": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+			},
+			expectedErrs: []error{nil, nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+				}},
+			},
+			upstreamPushErrs: []error{nil},
+			expectedCloseErr: nil,
+		},
+		"push to multiple shards and fill exactly capacity": {
+			shardCount: 2,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_3")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_4")}},
+			},
+			expectedErrs: []error{nil, nil, nil, nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_3"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_2"),
+					mockPreallocTimeseries("series_4"),
+				}},
+			},
+			upstreamPushErrs: []error{nil, nil},
+			expectedCloseErr: nil,
+		},
+		"push to single shard and underfill capacity": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+			},
+			expectedErrs: []error{nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+			},
+			upstreamPushErrs: []error{nil},
+			expectedCloseErr: nil,
+		},
+		"push to single shard and overfill capacity": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_3")}},
+			},
+			expectedErrs: []error{nil, nil, nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_3"),
+				}},
+			},
+			upstreamPushErrs: []error{nil, nil},
+			expectedCloseErr: nil,
+		},
+		"push to single shard and overfill only with the series of a singe request": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+					mockPreallocTimeseries("series_3"),
+				}},
+			},
+			expectedErrs: []error{nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_3"),
+				}},
+			},
+			upstreamPushErrs: []error{nil, nil},
+			expectedCloseErr: nil,
+		},
+		"push to multiple shards and overfill capacity on one shard and underfill on another": {
+			shardCount: 2,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_3")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_3")}},
+			},
+
+			expectedErrs: []error{nil, nil, nil, nil},
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_3"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_2"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_3"),
+				}},
+			},
+			upstreamPushErrs: []error{nil, nil, nil},
+			expectedCloseErr: nil,
+		},
+		"push to single shard and get an error with an underfilled shard (i.e. when calling Close() on the Pusher)": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+			},
+			expectedErrs: []error{nil, nil},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+				}},
+			},
+			upstreamPushErrs: []error{assert.AnError},
+			expectedCloseErr: assert.AnError,
+		},
+		"push to single shard and get an error with an overfilled shard (i.e. during some of the pushes)": {
+			shardCount: 1,
+			batchSize:  2,
+			requests: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_1")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_2")}},
+				{Timeseries: []mimirpb.PreallocTimeseries{mockPreallocTimeseries("series_3")}},
+			},
+			expectedErrs: []error{nil, nil, assert.AnError},
+
+			expectedUpstreamPushes: []*mimirpb.WriteRequest{
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_1"),
+					mockPreallocTimeseries("series_2"),
+				}},
+				{Timeseries: []mimirpb.PreallocTimeseries{
+					mockPreallocTimeseries("series_3"),
+				}},
+			},
+			upstreamPushErrs: []error{assert.AnError, nil},
+			expectedCloseErr: nil,
+		},
+	}
+
+	for name, tc := range testCases {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, len(tc.expectedUpstreamPushes), len(tc.upstreamPushErrs))
+			require.Equal(t, len(tc.expectedErrs), len(tc.requests))
+
+			pusher := &mockPusher{}
+			shardingP := newShardingPusher(noopHistogram, tc.shardCount, tc.batchSize, pusher)
+
+			for i, req := range tc.expectedUpstreamPushes {
+				pusher.On("PushToStorage", mock.Anything, req).Return(tc.upstreamPushErrs[i])
+			}
+			for i, req := range tc.requests {
+				err := shardingP.PushToStorage(context.Background(), req)
+				assert.ErrorIs(t, err, tc.expectedErrs[i])
+			}
+			closeErr := shardingP.close()
+			assert.ErrorIs(t, closeErr, tc.expectedCloseErr)
+			pusher.AssertExpectations(t)
+		})
+	}
 }
