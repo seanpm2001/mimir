@@ -1582,6 +1582,7 @@ func defaultReaderTestConfig(t *testing.T, addr string, topicName string, partit
 	}
 }
 
+// TODO dimitarvdimitrov make all consumers implement Close() and just rename consumerCloser to recordConsumer and keep only one interface
 type nopConsumerCloser struct {
 	recordConsumer
 }
