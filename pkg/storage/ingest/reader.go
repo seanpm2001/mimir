@@ -238,9 +238,9 @@ func (r *PartitionReader) processNextFetchesUntilTargetOrMaxLagHonored(ctx conte
 	logger := log.With(r.logger, "target_lag", targetLag, "max_lag", maxLag)
 	level.Info(logger).Log("msg", "partition reader is starting to consume partition until target and max consumer lag is honored")
 
-	attempts := []func() (currLag time.Duration, _ error){
+	attempts := []func(startOffset int64) (currLag time.Duration, _ error){
 		// First process fetches until at least the max lag is honored.
-		func() (time.Duration, error) {
+		func(startOffset int64) (time.Duration, error) {
 			return r.processNextFetchesUntilLagHonored(ctx, startOffset, maxLag, logger)
 		},
 
@@ -250,7 +250,7 @@ func (r *PartitionReader) processNextFetchesUntilTargetOrMaxLagHonored(ctx conte
 		// from Kafka (which means at most it takes 1s to ingest 2s of data): assuming new data is continuously
 		// written to the partition, we give the reader maxLag time to replay the backlog + ingest the new data
 		// written in the meanwhile.
-		func() (time.Duration, error) {
+		func(startOffset int64) (time.Duration, error) {
 			timedCtx, cancel := context.WithTimeoutCause(ctx, maxLag, errWaitTargetLagDeadlineExceeded)
 			defer cancel()
 
@@ -259,7 +259,7 @@ func (r *PartitionReader) processNextFetchesUntilTargetOrMaxLagHonored(ctx conte
 
 		// If the target lag hasn't been reached with the previous attempt that we'll move on. However,
 		// we still need to guarantee that in the meanwhile the lag didn't increase and max lag is still honored.
-		func() (time.Duration, error) {
+		func(startOffset int64) (time.Duration, error) {
 			return r.processNextFetchesUntilLagHonored(ctx, startOffset, maxLag, logger)
 		},
 	}
@@ -268,7 +268,7 @@ func (r *PartitionReader) processNextFetchesUntilTargetOrMaxLagHonored(ctx conte
 	for _, attempt := range attempts {
 		var err error
 
-		currLag, err = attempt()
+		currLag, err = attempt(startOffset)
 		if errors.Is(err, errWaitTargetLagDeadlineExceeded) {
 			continue
 		}
@@ -283,6 +283,7 @@ func (r *PartitionReader) processNextFetchesUntilTargetOrMaxLagHonored(ctx conte
 			)
 			return nil
 		}
+		startOffset = r.consumedOffsetWatcher.LastConsumedOffset()
 	}
 
 	level.Warn(logger).Log(
