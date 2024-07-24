@@ -357,7 +357,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		}
 
 		if boff.Err() != nil {
-			return 0, boff.Err()
+			return 0, boff.ErrCause()
 		}
 
 		// If it took less than the max desired lag to replay the partition
@@ -367,7 +367,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		}
 	}
 
-	return 0, boff.Err()
+	return 0, boff.ErrCause()
 }
 
 func filterOutErrFetches(fetches kgo.Fetches) kgo.Fetches {
