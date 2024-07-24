@@ -305,7 +305,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		MaxRetries: 0, // Retry forever (unless context is canceled / deadline exceeded).
 	})
 
-	fetcher, err := newConcurrentFetchers(ctx, r.client, r.logger, r.reg, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, r.kafkaCfg.RecordsPerFetch, &r.metrics)
+	fetcher, err := newConcurrentFetchers(ctx, r.client, r.logger, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, r.kafkaCfg.RecordsPerFetch, &r.metrics)
 	if err != nil {
 		return 0, errors.Wrap(err, "creating fetcher")
 	}
@@ -756,16 +756,15 @@ type concurrentFetchers struct {
 	metrics     *readerMetrics
 	tracer      *kotel.Tracer
 
-	concurrency            int
-	nextFetchOffset        int64
-	fetchesCompressedBytes prometheus.Counter
+	concurrency     int
+	nextFetchOffset int64
 
 	orderedFetches  chan kgo.FetchPartition
 	recordsPerFetch int
 }
 
 // newConcurrentFetchers creates a new concurrentFetchers. startOffset can be kafkaOffsetStart, kafkaOffsetEnd or a specific offset.
-func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.Logger, reg prometheus.Registerer, topic string, partition int32, startOffset int64, concurrency int, recordsPerFetch int, metrics *readerMetrics) (*concurrentFetchers, error) {
+func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.Logger, topic string, partition int32, startOffset int64, concurrency int, recordsPerFetch int, metrics *readerMetrics) (*concurrentFetchers, error) {
 	f := &concurrentFetchers{
 		client:          client,
 		logger:          logger,
@@ -776,10 +775,6 @@ func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.L
 		recordsPerFetch: recordsPerFetch,
 		tracer:          kotel.NewTracer(kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))),
 		orderedFetches:  make(chan kgo.FetchPartition, 1),
-		fetchesCompressedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Name: "cortex_ingest_storage_reader_fetches_compressed_bytes_total",
-			Help: "Total number of compressed bytes fetched from Kafka by the consumer.",
-		}),
 	}
 
 	var err error
@@ -863,7 +858,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant) kgo.F
 		}
 	}
 	rawPartitionResp := resp.Topics[0].Partitions[0]
-	r.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
+	r.metrics.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
 	level.Info(r.logger).Log(
 		"msg", "fetched records",
@@ -1395,6 +1390,7 @@ type readerMetrics struct {
 	fetchesErrors             prometheus.Counter
 	fetchesTotal              prometheus.Counter
 	fetchedBytes              prometheus.Counter
+	fetchesCompressedBytes    prometheus.Counter
 	fetchWaitDuration         prometheus.Histogram
 	strongConsistencyRequests prometheus.Counter
 	strongConsistencyFailures prometheus.Counter
@@ -1448,6 +1444,10 @@ func newReaderMetrics(partitionID int32, reg prometheus.Registerer) readerMetric
 		fetchedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ingest_storage_reader_fetched_bytes_total",
 			Help: "Total number of record bytes fetched from Kafka by the consumer.",
+		}),
+		fetchesCompressedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_ingest_storage_reader_fetches_compressed_bytes_total",
+			Help: "Total number of compressed bytes fetched from Kafka by the consumer.",
 		}),
 		consumeLatency: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
 			Name:                        "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
