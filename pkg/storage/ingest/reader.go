@@ -99,6 +99,14 @@ func (c consumerFactoryFunc) consumer() consumerCloser {
 	return c()
 }
 
+type noopPusherCloser struct {
+	Pusher
+}
+
+func (noopPusherCloser) Close() []error {
+	return nil
+}
+
 func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instanceID string, pusher Pusher, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
 	consumerProto := newPusherConsumerPrototype(util_log.NewSampler(kafkaCfg.FallbackClientErrorSampleRate), reg, logger)
 	numTimeSeriesPerFlush := promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
@@ -107,6 +115,9 @@ func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instan
 		NativeHistogramBucketFactor: 1.1,
 	})
 	factory := consumerFactoryFunc(func() consumerCloser {
+		if kafkaCfg.ReplayShards == 0 {
+			return newPusherConsumer(noopPusherCloser{pusher}, consumerProto)
+		}
 		return newPusherConsumer(newMultiTenantPusher(numTimeSeriesPerFlush, pusher, kafkaCfg.ReplayShards, kafkaCfg.BatchSize), consumerProto)
 	})
 	return newPartitionReader(kafkaCfg, partitionID, instanceID, factory, logger, reg)
