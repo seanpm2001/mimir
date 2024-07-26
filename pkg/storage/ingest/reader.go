@@ -223,13 +223,13 @@ func (r *PartitionReader) stopDependencies() error {
 func (r *PartitionReader) run(ctx context.Context) error {
 	for ctx.Err() == nil {
 		fetches := r.pollFetches(ctx)
-		r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenRunning)
+		r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenRunning, nil)
 	}
 
 	return nil
 }
 
-func (r *PartitionReader) processFetches(ctx context.Context, fetches kgo.Fetches, delayObserver prometheus.Observer) {
+func (r *PartitionReader) processFetches(ctx context.Context, fetches kgo.Fetches, delayObserver prometheus.Observer, consumer consumerCloser) {
 	r.recordFetchesMetrics(fetches, delayObserver)
 	r.logFetchErrors(fetches)
 	fetches = filterOutErrFetches(fetches)
@@ -237,7 +237,7 @@ func (r *PartitionReader) processFetches(ctx context.Context, fetches kgo.Fetche
 	// TODO consumeFetches() may get interrupted in the middle because of ctx canceled due to PartitionReader stopped.
 	// 		We should improve it, but we shouldn't just pass a context.Background() because if consumption is stuck
 	// 		then PartitionReader will never stop.
-	r.consumeFetches(ctx, fetches)
+	r.consumeFetches(ctx, fetches, consumer)
 	r.enqueueCommit(fetches)
 	r.notifyLastConsumedOffset(fetches)
 }
@@ -330,6 +330,8 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 	} else {
 		fetcher = r
 	}
+	consumer := r.newConsumer.consumer()
+	defer consumer.Close(ctx)
 
 	//defer func() {
 	//	r.setPollingStartOffset(r.consumedOffsetWatcher.LastConsumedOffset())
@@ -374,7 +376,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 				break
 			}
 			fetches := fetcher.pollFetches(ctx)
-			r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenStarting)
+			r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenStarting, consumer)
 		}
 
 		if boff.Err() != nil {
@@ -454,7 +456,12 @@ func (r *PartitionReader) enqueueCommit(fetches kgo.Fetches) {
 	r.committer.enqueueOffset(lastOffset)
 }
 
-func (r *PartitionReader) consumeFetches(ctx context.Context, fetches kgo.Fetches) {
+func (r *PartitionReader) consumeFetches(ctx context.Context, fetches kgo.Fetches, consumer consumerCloser) {
+	if consumer == nil {
+		consumer = r.newConsumer.consumer()
+		defer consumer.Close(ctx) // TODO dimitarvdimitrov this case should be encountered only when consuming at stable state not during cold replay; handle error properly
+	}
+
 	if fetches.NumRecords() == 0 {
 		return
 	}
@@ -484,17 +491,14 @@ func (r *PartitionReader) consumeFetches(ctx context.Context, fetches kgo.Fetche
 
 	for boff.Ongoing() {
 		consumeStart := time.Now()
-		consumer := r.newConsumer.consumer()
 		err := consumer.consume(ctx, records)
-		err2 := consumer.Close(ctx)
 		r.metrics.consumeLatency.Observe(time.Since(consumeStart).Seconds())
-		if err == nil && len(err2) == 0 {
+		if err == nil {
 			break
 		}
 		level.Error(r.logger).Log(
 			"msg", "encountered error while ingesting data from Kafka; will retry",
 			"err", err,
-			"err2", fmt.Sprint(err2),
 			"record_min_offset", minOffset,
 			"record_max_offset", maxOffset,
 			"num_retries", boff.NumRetries(),
