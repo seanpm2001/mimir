@@ -316,9 +316,19 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		MaxRetries: 0, // Retry forever (unless context is canceled / deadline exceeded).
 	})
 
-	fetcher, err := newConcurrentFetchers(ctx, r.client, r.logger, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, r.kafkaCfg.RecordsPerFetch, &r.metrics)
-	if err != nil {
-		return 0, errors.Wrap(err, "creating fetcher")
+	type fetcherI interface {
+		pollFetches(ctx2 context.Context) kgo.Fetches
+	}
+
+	var fetcher fetcherI
+	if r.kafkaCfg.ReplayConcurrency > 1 {
+		var err error
+		fetcher, err = newConcurrentFetchers(ctx, r.client, r.logger, r.kafkaCfg.Topic, r.partitionID, startOffset, r.kafkaCfg.ReplayConcurrency, r.kafkaCfg.RecordsPerFetch, &r.metrics)
+		if err != nil {
+			return 0, errors.Wrap(err, "creating fetcher")
+		}
+	} else {
+		fetcher = r
 	}
 
 	//defer func() {
