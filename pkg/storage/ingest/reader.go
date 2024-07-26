@@ -330,6 +330,9 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 	} else {
 		fetcher = r
 	}
+	// TODO dimitarvdimitrov this means that we don't have a good way of retrying the errors because we might ingest a fetch,
+	// 		move onto with next fetch and then the next fetches will get the error of the first fetch.
+	// 		We need a way to retry the fetches that failed; perhaps we need a retry mechanism on each shard.
 	consumer := r.newConsumer.consumer()
 	defer consumer.Close(ctx)
 
