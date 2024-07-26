@@ -764,8 +764,8 @@ type fetchWant struct {
 	startOffset int64 // inclusive
 	endOffset   int64 // exclusive
 	// result should be closed when there are no more fetches for this partition. It is ok to send multiple times on the channel.
-	result chan kgo.FetchPartition
-	// TODO dimitarvdimitrov consider including expected bytes here so we can tell kafka to not send a ton of bytes back. We can estimate those.
+	result   chan kgo.FetchPartition
+	maxBytes int32
 }
 
 type concurrentFetchers struct {
@@ -868,13 +868,13 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant) kgo.F
 			LastFetchedEpoch:   -1,
 			CurrentLeaderEpoch: -1,
 			LogStartOffset:     -1,
-			PartitionMaxBytes:  100_000_000,
+			PartitionMaxBytes:  w.maxBytes,
 		}},
 	}}
 	req.MinBytes = 1
 	req.Version = 13
 	req.MaxWaitMillis = 10000
-	req.MaxBytes = 100_000_000
+	req.MaxBytes = w.maxBytes
 	req.SessionEpoch = -1
 
 	resp, err := req.RequestWith(ctx, r.client)
@@ -1017,10 +1017,12 @@ func nextFetchWant(fetch fetchWant, recordsPerFetch int) fetchWant {
 }
 
 func fetchWantFrom(offset int64, recordsPerFetch int) fetchWant {
+	const bytesPerRecord = 70_000 // TODO dimitarvdimitrov either make this configurable or make this self-tunable based on the last few fetches
 	return fetchWant{
 		startOffset: offset,
 		endOffset:   offset + int64(recordsPerFetch),
 		result:      make(chan kgo.FetchPartition, 1),
+		maxBytes:    int32(recordsPerFetch * bytesPerRecord),
 	}
 }
 
