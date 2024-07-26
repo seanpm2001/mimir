@@ -965,7 +965,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 					boff.Reset()
 					lastOffset := f.Records[len(f.Records)-1].Offset
 					w.startOffset = lastOffset + 1
-					// TODO dimitarvdimitrov also change maxbytes so we don't undermine the fetches of the next fetch
+					w.maxBytes = int32((w.endOffset-w.startOffset)*70_000) + 1_000_000 // add 1MiB just to make sure we don't end up refetching forever
 					level.Info(logger).Log("msg", "received records", "new_start_offset", w.startOffset, "new_end_offset", w.endOffset)
 					select {
 					case w.result <- f:
