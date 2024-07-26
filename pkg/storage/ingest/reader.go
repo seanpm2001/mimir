@@ -778,10 +778,10 @@ type concurrentFetchers struct {
 	tracer      *kotel.Tracer
 
 	concurrency     int
-	nextFetchOffset int64
-
-	orderedFetches  chan kgo.FetchPartition
 	recordsPerFetch int
+
+	orderedFetches     chan kgo.FetchPartition
+	lastReturnedRecord int64
 }
 
 // newConcurrentFetchers creates a new concurrentFetchers. startOffset can be kafkaOffsetStart, kafkaOffsetEnd or a specific offset.
@@ -832,11 +832,19 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 	case <-ctx.Done():
 		return kgo.Fetches{}
 	case f := <-r.orderedFetches:
-		// TODO dimitarvdimitrov ignore records that we've already returned
 		r.logger.Log("msg", "received ordered fetch", "num_records", len(f.Records))
+		trimUntil := 0
 		f.EachRecord(func(record *kgo.Record) {
 			r.tracer.OnFetchRecordUnbuffered(record, true)
+			if record.Offset <= r.lastReturnedRecord {
+				trimUntil++
+			}
 		})
+
+		r.lastReturnedRecord = f.Records[len(f.Records)-1].Offset
+		f.Records = f.Records[trimUntil:]
+
+		r.metrics.fetchedDiscardedRecords.Add(float64(trimUntil))
 		return kgo.Fetches{{
 			Topics: []kgo.FetchTopic{
 				{
@@ -1413,6 +1421,7 @@ type readerMetrics struct {
 	fetchedBytes              prometheus.Counter
 	fetchesCompressedBytes    prometheus.Counter
 	fetchWaitDuration         prometheus.Histogram
+	fetchedDiscardedRecords   prometheus.Counter
 	strongConsistencyRequests prometheus.Counter
 	strongConsistencyFailures prometheus.Counter
 	strongConsistencyLatency  prometheus.Histogram
@@ -1469,6 +1478,10 @@ func newReaderMetrics(partitionID int32, reg prometheus.Registerer) readerMetric
 		fetchesCompressedBytes: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Name: "cortex_ingest_storage_reader_fetches_compressed_bytes_total",
 			Help: "Total number of compressed bytes fetched from Kafka by the consumer.",
+		}),
+		fetchedDiscardedRecords: promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "cortex_ingest_storage_reader_fetched_discarded_records_total",
+			Help: "Total number of records discarded by the consumer because they were already consumed.",
 		}),
 		consumeLatency: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
 			Name:                        "cortex_ingest_storage_reader_records_batch_process_duration_seconds",
