@@ -233,7 +233,7 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 	}
 
 	f.requestQueue.SubmitRegisterQuerierConnection(querierID)
-	defer f.requestQueue.SubmitUnregisterQuerierConnection(querierID)
+	defer f.requestQueue.SubmitUnregisterQuerierworkerConn(querierID)
 
 	lastTenantIndex := queue.FirstTenant()
 

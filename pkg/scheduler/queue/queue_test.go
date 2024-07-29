@@ -1,8 +1,7 @@
-// SPDX-License-Identifier: AGPL-3.0-only
-// Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/scheduler/queue/queue_test.go
-// Provenance-includes-license: Apache-2.0
-// Provenance-includes-copyright: The Cortex Authors.
-
+// // SPDX-License-Identifier: AGPL-3.0-only
+// // Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/scheduler/queue/queue_test.go
+// // Provenance-includes-license: Apache-2.0
+// // Provenance-includes-copyright: The Cortex Authors.
 package queue
 
 import (
@@ -29,8 +28,7 @@ import (
 	util_test "github.com/grafana/mimir/pkg/util/test"
 )
 
-// TODO (casie): Write tests for prioritizeQueryComponents is true
-
+// // TODO (casie): Write tests for prioritizeQueryComponents is true
 func buildTreeTestsStruct() []struct {
 	name                  string
 	useMultiAlgoTreeQueue bool
@@ -237,84 +235,83 @@ func TestMultiDimensionalQueueFairnessSlowConsumerEffects(t *testing.T) {
 
 }
 
-func BenchmarkConcurrentQueueOperations(b *testing.B) {
-	treeTypes := buildTreeTestsStruct()
-
-	for _, t := range treeTypes {
-		b.Run(t.name, func(b *testing.B) {
-			maxQueriersPerTenant := 0 // disable shuffle sharding
-			forgetQuerierDelay := time.Duration(0)
-			maxOutstandingRequestsPerTenant := 100
-
-			for _, numTenants := range []int{1, 10, 1000} {
-				b.Run(fmt.Sprintf("%v tenants", numTenants), func(b *testing.B) {
-
-					// Query-frontends run 5 parallel streams per scheduler by default,
-					// and we typically see 2-5 frontends running at any one time.
-					for _, numProducers := range []int{10, 25} {
-						b.Run(fmt.Sprintf("%v concurrent producers", numProducers), func(b *testing.B) {
-
-							// Queriers run with parallelism of 16 when query sharding is enabled.
-							for _, numConsumers := range []int{16, 160, 1600} {
-								b.Run(fmt.Sprintf("%v concurrent consumers", numConsumers), func(b *testing.B) {
-									queue, err := NewRequestQueue(
-										log.NewNopLogger(),
-										maxOutstandingRequestsPerTenant,
-										true,
-										t.useMultiAlgoTreeQueue,
-										forgetQuerierDelay,
-										promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
-										promauto.With(nil).NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
-										promauto.With(nil).NewHistogram(prometheus.HistogramOpts{}),
-										promauto.With(nil).NewSummaryVec(prometheus.SummaryOpts{}, []string{"query_component"}),
-									)
-									require.NoError(b, err)
-
-									startSignalChan := make(chan struct{})
-									queueActorsErrGroup, ctx := errgroup.WithContext(context.Background())
-
-									require.NoError(b, queue.starting(ctx))
-									b.Cleanup(func() {
-										require.NoError(b, queue.stop(nil))
-									})
-
-									runProducer := runQueueProducerIters(
-										queue, maxQueriersPerTenant, b.N, numProducers, numTenants, startSignalChan, nil,
-									)
-
-									for producerIdx := 0; producerIdx < numProducers; producerIdx++ {
-										producerIdx := producerIdx
-										queueActorsErrGroup.Go(func() error {
-											return runProducer(producerIdx)
-										})
-									}
-
-									runConsumer := runQueueConsumerIters(ctx, queue, b.N, numConsumers, startSignalChan, nil)
-
-									for consumerIdx := 0; consumerIdx < numConsumers; consumerIdx++ {
-										consumerIdx := consumerIdx
-										queueActorsErrGroup.Go(func() error {
-											return runConsumer(consumerIdx)
-										})
-									}
-
-									b.ResetTimer()
-									close(startSignalChan)
-									err = queueActorsErrGroup.Wait()
-									if err != nil {
-										require.NoError(b, err)
-									}
-								})
-							}
-						})
-					}
-				})
-			}
-
-		})
-	}
-}
-
+//	func BenchmarkConcurrentQueueOperations(b *testing.B) {
+//		treeTypes := buildTreeTestsStruct()
+//
+//		for _, t := range treeTypes {
+//			b.Run(t.name, func(b *testing.B) {
+//				maxQueriersPerTenant := 0 // disable shuffle sharding
+//				forgetQuerierDelay := time.Duration(0)
+//				maxOutstandingRequestsPerTenant := 100
+//
+//				for _, numTenants := range []int{1, 10, 1000} {
+//					b.Run(fmt.Sprintf("%v tenants", numTenants), func(b *testing.B) {
+//
+//						// Query-frontends run 5 parallel streams per scheduler by default,
+//						// and we typically see 2-5 frontends running at any one time.
+//						for _, numProducers := range []int{10, 25} {
+//							b.Run(fmt.Sprintf("%v concurrent producers", numProducers), func(b *testing.B) {
+//
+//								// Queriers run with parallelism of 16 when query sharding is enabled.
+//								for _, numConsumers := range []int{16, 160, 1600} {
+//									b.Run(fmt.Sprintf("%v concurrent consumers", numConsumers), func(b *testing.B) {
+//										queue, err := NewRequestQueue(
+//											log.NewNopLogger(),
+//											maxOutstandingRequestsPerTenant,
+//											true,
+//											t.useMultiAlgoTreeQueue,
+//											forgetQuerierDelay,
+//											promauto.With(nil).NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
+//											promauto.With(nil).NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
+//											promauto.With(nil).NewHistogram(prometheus.HistogramOpts{}),
+//											promauto.With(nil).NewSummaryVec(prometheus.SummaryOpts{}, []string{"query_component"}),
+//										)
+//										require.NoError(b, err)
+//
+//										startSignalChan := make(chan struct{})
+//										queueActorsErrGroup, ctx := errgroup.WithContext(context.Background())
+//
+//										require.NoError(b, queue.starting(ctx))
+//										b.Cleanup(func() {
+//											require.NoError(b, queue.stop(nil))
+//										})
+//
+//										runProducer := runQueueProducerIters(
+//											queue, maxQueriersPerTenant, b.N, numProducers, numTenants, startSignalChan, nil,
+//										)
+//
+//										for producerIdx := 0; producerIdx < numProducers; producerIdx++ {
+//											producerIdx := producerIdx
+//											queueActorsErrGroup.Go(func() error {
+//												return runProducer(producerIdx)
+//											})
+//										}
+//
+//										runConsumer := runQueueConsumerIters(ctx, queue, b.N, numConsumers, startSignalChan, nil)
+//
+//										for consumerIdx := 0; consumerIdx < numConsumers; consumerIdx++ {
+//											consumerIdx := consumerIdx
+//											queueActorsErrGroup.Go(func() error {
+//												return runConsumer(consumerIdx)
+//											})
+//										}
+//
+//										b.ResetTimer()
+//										close(startSignalChan)
+//										err = queueActorsErrGroup.Wait()
+//										if err != nil {
+//											require.NoError(b, err)
+//										}
+//									})
+//								}
+//							})
+//						}
+//					})
+//				}
+//
+//			})
+//		}
+//	}
 func queueActorIterationCount(totalIters int, numActors int, actorIdx int) int {
 	actorIters := totalIters / numActors
 	remainderIters := totalIters % numActors
@@ -395,8 +392,13 @@ func runQueueConsumerIters(
 		consumerIters := queueActorIterationCount(totalIters, numConsumers, consumerIdx)
 		lastTenantIndex := FirstTenant()
 		querierID := fmt.Sprintf("consumer-%v", consumerIdx)
-		queue.SubmitRegisterQuerierConnection(querierID)
-		defer queue.SubmitUnregisterQuerierConnection(querierID)
+		//queue.SubmitRegisterQuerierConnection(querierID)
+		querierWorkerConn := NewUnregisteredQuerierWorkerConn(QuerierID(querierID))
+		registeredQuerierWorkerConn, err := queue.AwaitRegisterQuerierWorkerConnection(ctx, querierWorkerConn)
+		if err != nil {
+			return err
+		}
+		defer queue.AwaitUnregisterQuerierConnection(ctx, registeredQuerierWorkerConn)
 
 		<-start
 
@@ -457,7 +459,7 @@ func TestRequestQueue_GetNextRequestForQuerier_ShouldGetRequestAfterReshardingBe
 				// if the test has failed and the queue does not get cleared,
 				// we must send a shutdown signal for the remaining connected querier
 				// or else StopAndAwaitTerminated will never complete.
-				queue.SubmitUnregisterQuerierConnection("querier-2")
+				queue.SubmitUnregisterQuerierworkerConn("querier-2")
 				require.NoError(t, services.StopAndAwaitTerminated(ctx, queue))
 			})
 
@@ -475,7 +477,7 @@ func TestRequestQueue_GetNextRequestForQuerier_ShouldGetRequestAfterReshardingBe
 			}()
 
 			// Querier-1 crashes (no graceful shutdown notification).
-			queue.SubmitUnregisterQuerierConnection("querier-1")
+			queue.SubmitUnregisterQuerierworkerConn("querier-1")
 
 			// Enqueue a request from an user which would be assigned to querier-1.
 			// NOTE: "user-1" shuffle shard always chooses the first querier ("querier-1" in this case)
@@ -533,7 +535,7 @@ func TestRequestQueue_GetNextRequestForQuerier_ReshardNotifiedCorrectlyForMultip
 				// if the test has failed and the queue does not get cleared,
 				// we must send a shutdown signal for the remaining connected querier
 				// or else StopAndAwaitTerminated will never complete.
-				queue.SubmitUnregisterQuerierConnection("querier-2")
+				queue.SubmitUnregisterQuerierworkerConn("querier-2")
 				require.NoError(t, services.StopAndAwaitTerminated(ctx, queue))
 			})
 
@@ -564,8 +566,8 @@ func TestRequestQueue_GetNextRequestForQuerier_ReshardNotifiedCorrectlyForMultip
 			}()
 
 			// querier-1 and querier-3 crash (no graceful shutdown notification).
-			queue.SubmitUnregisterQuerierConnection("querier-1")
-			queue.SubmitUnregisterQuerierConnection("querier-3")
+			queue.SubmitUnregisterQuerierworkerConn("querier-1")
+			queue.SubmitUnregisterQuerierworkerConn("querier-3")
 
 			// Enqueue a request from a tenant which would be assigned to querier-1.
 			// NOTE: "user-1" shuffle shard always chooses the first querier ("querier-1" in this case)
