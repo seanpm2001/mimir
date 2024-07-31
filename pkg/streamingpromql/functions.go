@@ -69,8 +69,15 @@ func InstantVectorLabelManipulationFunctionOperatorFactory(name string, metadata
 //   - name: The name of the function
 //   - metadataFunc: The function for handling metadata
 //   - stepFunc: The function to handle a range vector step
+//   - validationFunc: The function that checks and emits annotations for each series after all steps for a series have been evaluated
 //   - needMetricNames: If true, stepFunc emits annotations that contain the metric names for each series
-func SingleRangeVectorFunctionOperatorFactory(name string, metadataFunc functions.SeriesMetadataFunction, stepFunc functions.RangeVectorStepFunction, needMetricNames bool) InstantVectorFunctionOperatorFactory {
+func SingleRangeVectorFunctionOperatorFactory(
+	name string,
+	metadataFunc functions.SeriesMetadataFunction,
+	stepFunc functions.RangeVectorStepFunction,
+	validationFunc functions.RangeVectorSeriesValidationFunction,
+	needMetricNames bool,
+) InstantVectorFunctionOperatorFactory {
 	return func(args []types.Operator, pool *pooling.LimitingPool, annotations *annotations.Annotations, expressionPosition posrange.PositionRange) (types.InstantVectorOperator, error) {
 		if len(args) != 1 {
 			// Should be caught by the PromQL parser, but we check here for safety.
@@ -83,19 +90,19 @@ func SingleRangeVectorFunctionOperatorFactory(name string, metadataFunc function
 			return nil, fmt.Errorf("expected a range vector argument for %s, got %T", name, args[0])
 		}
 
-		return operators.NewFunctionOverRangeVector(inner, pool, metadataFunc, stepFunc, needMetricNames, annotations, expressionPosition), nil
+		return operators.NewFunctionOverRangeVector(inner, pool, metadataFunc, stepFunc, validationFunc, needMetricNames, annotations, expressionPosition), nil
 	}
 }
 
 // RangeVectorTransformationFunctionOperatorFactory creates an InstantVectorFunctionOperatorFactory for functions
-// that have exactly 1 argument (v range-vector), and drop the series __name__ label.
+// that have exactly 1 argument (v range-vector), drop the series __name__ label, and do no per-series validation.
 //
 // Parameters:
 //   - name: The name of the function
 //   - stepFunc: The function to handle a range vector step
 //   - needMetricNames: If true, stepFunc emits annotations that contain the metric names for each series
 func RangeVectorTransformationFunctionOperatorFactory(name string, stepFunc functions.RangeVectorStepFunction, needMetricNames bool) InstantVectorFunctionOperatorFactory {
-	return SingleRangeVectorFunctionOperatorFactory(name, functions.DropSeriesName, stepFunc, needMetricNames)
+	return SingleRangeVectorFunctionOperatorFactory(name, functions.DropSeriesName, stepFunc, nil, needMetricNames)
 }
 
 // These functions return an instant-vector.
@@ -119,7 +126,7 @@ var instantVectorFunctionOperatorFactories = map[string]InstantVectorFunctionOpe
 	"log10":           InstantVectorTransformationFunctionOperatorFactory("log10", functions.Log10),
 	"log2":            InstantVectorTransformationFunctionOperatorFactory("log2", functions.Log2),
 	"rad":             InstantVectorTransformationFunctionOperatorFactory("rad", functions.Rad),
-	"rate":            RangeVectorTransformationFunctionOperatorFactory("rate", functions.Rate, true),
+	"rate":            SingleRangeVectorFunctionOperatorFactory("rate", functions.DropSeriesName, functions.Rate, functions.RateSeriesValidator, true),
 	"sgn":             InstantVectorTransformationFunctionOperatorFactory("sgn", functions.Sgn),
 	"sin":             InstantVectorTransformationFunctionOperatorFactory("sin", functions.Sin),
 	"sinh":            InstantVectorTransformationFunctionOperatorFactory("sinh", functions.Sinh),

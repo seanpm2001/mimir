@@ -23,8 +23,9 @@ type FunctionOverRangeVector struct {
 	Inner types.RangeVectorOperator
 	Pool  *pooling.LimitingPool
 
-	MetadataFunc functions.SeriesMetadataFunction
-	StepFunc     functions.RangeVectorStepFunction
+	MetadataFunc         functions.SeriesMetadataFunction
+	StepFunc             functions.RangeVectorStepFunction
+	SeriesValidationFunc functions.RangeVectorSeriesValidationFunction
 
 	Annotations *annotations.Annotations
 
@@ -46,17 +47,19 @@ func NewFunctionOverRangeVector(
 	pool *pooling.LimitingPool,
 	metadataFunc functions.SeriesMetadataFunction,
 	stepFunc functions.RangeVectorStepFunction,
+	seriesValidationFunc functions.RangeVectorSeriesValidationFunction,
 	needMetricNames bool,
 	annotations *annotations.Annotations,
 	expressionPosition posrange.PositionRange,
 ) *FunctionOverRangeVector {
 	o := &FunctionOverRangeVector{
-		Inner:              inner,
-		Pool:               pool,
-		MetadataFunc:       metadataFunc,
-		StepFunc:           stepFunc,
-		Annotations:        annotations,
-		expressionPosition: expressionPosition,
+		Inner:                inner,
+		Pool:                 pool,
+		MetadataFunc:         metadataFunc,
+		StepFunc:             stepFunc,
+		SeriesValidationFunc: seriesValidationFunc,
+		Annotations:          annotations,
+		expressionPosition:   expressionPosition,
 	}
 
 	if needMetricNames {
@@ -113,6 +116,10 @@ func (m *FunctionOverRangeVector) NextSeries(ctx context.Context) (types.Instant
 
 		// nolint:errorlint // errors.Is introduces a performance overhead, and NextStepSamples is guaranteed to return exactly EOS, never a wrapped error.
 		if err == types.EOS {
+			if m.SeriesValidationFunc != nil {
+				m.SeriesValidationFunc(data, m.metricNames.GetMetricNameForSeries(m.currentSeriesIndex), m.emitAnnotation)
+			}
+
 			return data, nil
 		} else if err != nil {
 			return types.InstantVectorSeriesData{}, err
