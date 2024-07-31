@@ -35,6 +35,18 @@ std.manifestYamlDoc({
       extraArguments: ['-ingester.ring.instance-availability-zone=zone-a'],
       extraVolumes: ['.data-mimir-write-zone-a-3:/data:delegated'],
     }),
+    'mimir-write-zone-c-61': mimirService({
+      name: 'mimir-write-zone-c-61',
+      target: 'write',
+      publishedHttpPort: 8064,
+      extraArguments: [
+        '-ingester.ring.instance-availability-zone=zone-c',
+        '-ingester.ring.instance-id=ingester-zone-c-61',
+        '-ingester.partition-ring.prefix=exclusive-prefix',
+        '-ingester.ring.prefix=exclusive-prefix',
+      ],
+      extraVolumes: ['.data-mimir-write-zone-c-61:/data:delegated'],
+    }),
 
     // Zone-b.
     'mimir-write-zone-b-1': mimirService({

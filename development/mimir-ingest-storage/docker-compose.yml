@@ -280,6 +280,33 @@
       - "./config:/mimir/config"
       - "./activity:/activity"
       - ".data-mimir-write-zone-b-3:/data:delegated"
+  "mimir-write-zone-c-61":
+    "build":
+      "context": "."
+      "dockerfile": "dev.dockerfile"
+    "command":
+      - "./mimir"
+      - "-config.file=./config/mimir.yaml"
+      - "-target=write"
+      - "-activity-tracker.filepath=/activity/mimir-write-zone-c-61"
+      - "-ingester.ring.instance-availability-zone=zone-c"
+      - "-ingester.ring.instance-id=ingester-zone-c-61"
+      - "-ingester.partition-ring.prefix=exclusive-prefix"
+      - "-ingester.ring.prefix=exclusive-prefix"
+    "depends_on":
+      "kafka":
+        "condition": "service_healthy"
+      "minio":
+        "condition": "service_started"
+    "environment": []
+    "hostname": "mimir-write-zone-c-61"
+    "image": "mimir"
+    "ports":
+      - "8064:8080"
+    "volumes":
+      - "./config:/mimir/config"
+      - "./activity:/activity"
+      - ".data-mimir-write-zone-c-61:/data:delegated"
   "minio":
     "command":
       - "server"

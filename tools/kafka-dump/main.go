@@ -16,9 +16,38 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/plugin/kprom"
 	"go.uber.org/atomic"
+
+	"github.com/grafana/mimir/pkg/mimirpb"
 )
 
 func main() {
+
+	bytes, err := os.ReadFile("write-request.pb")
+	if err != nil {
+		panic(err)
+	}
+	wr := mimirpb.WriteRequest{}
+	err = wr.Unmarshal(bytes)
+	if err != nil {
+		panic(err)
+	}
+	j, err := json.Marshal(wr)
+	if err != nil {
+		panic(err)
+	}
+
+	for seriesIdx, v := range wr.Timeseries {
+		labels := map[string]string{}
+		for _, l := range v.Labels {
+			if labels[l.Name] != "" {
+				//fmt.Println("duplicate label", l.Name, "series", seriesIdx)
+			}
+			_ = seriesIdx
+			labels[l.Name] = l.Value
+		}
+	}
+	fmt.Println(string(j))
+	return
 	topic := flag.String("topic", "mimir", "Kafka topic to dump")
 	brokers := flag.String("brokers", "localhost:9092", "Kafka brokers")
 	partition := flag.Int("partition", 0, "Kafka partition to dump or import into")
