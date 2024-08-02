@@ -335,7 +335,7 @@ func (p *shardingPusher) PushToStorage(ctx context.Context, request *mimirpb.Wri
 // TODO dimitarvdimitrov support metadata
 func (p *shardingPusher) runShard(timeseries chan shardedPush) {
 	defer p.wg.Done()
-	timeseriesBatch := make([]mimirpb.PreallocTimeseries, 0, p.batchSize)
+	timeseriesBatch := mimirpb.PreallocTimeseriesSliceFromPool()
 
 	flush := func(ctx context.Context) {
 		p.numTimeSeriesPerFlush.Observe(float64(len(timeseriesBatch)))
@@ -343,7 +343,7 @@ func (p *shardingPusher) runShard(timeseries chan shardedPush) {
 		if err != nil {
 			p.errs <- err
 		}
-		timeseriesBatch = timeseriesBatch[:0]
+		timeseriesBatch = mimirpb.PreallocTimeseriesSliceFromPool()
 	}
 
 	var lastCtx context.Context
