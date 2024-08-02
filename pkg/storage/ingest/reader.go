@@ -338,12 +338,6 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 	} else {
 		fetcher = r
 	}
-	// TODO dimitarvdimitrov this means that we don't have a good way of retrying the errors because we might ingest a fetch,
-	// 		move onto with next fetch and then the next fetches will get the error of the first fetch.
-	// 		We need a way to retry the fetches that failed; perhaps we need a retry mechanism on each shard.
-	consumer := r.newConsumer.consumer()
-	defer consumer.Close(ctx)
-
 	//defer func() {
 	//	r.setPollingStartOffset(r.consumedOffsetWatcher.LastConsumedOffset())
 	//}()
@@ -379,7 +373,6 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 		// This message is NOT expected to be logged with a very high rate. In this log we display the last measured
 		// lag. If we don't have it (lag is zero value), then it will not be logged.
 		level.Info(loggerWithCurrentLagIfSet(logger, currLag)).Log("msg", "partition reader is consuming records to honor target and max consumer lag", "partition_start_offset", partitionStartOffset, "last_produced_offset", lastProducedOffset)
-
 		for boff.Ongoing() {
 			// Continue reading until we reached the desired offset.
 			lastConsumedOffset := r.consumedOffsetWatcher.LastConsumedOffset()
@@ -387,7 +380,7 @@ func (r *PartitionReader) processNextFetchesUntilLagHonored(ctx context.Context,
 				break
 			}
 			fetches := fetcher.pollFetches(ctx)
-			r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenStarting, consumer)
+			r.processFetches(ctx, fetches, r.metrics.receiveDelayWhenStarting, nil)
 		}
 
 		if boff.Err() != nil {
