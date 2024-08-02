@@ -808,7 +808,7 @@ func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.L
 		metrics:         metrics,
 		recordsPerFetch: recordsPerFetch,
 		tracer:          kotel.NewTracer(kotel.TracerPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))),
-		orderedFetches:  make(chan kgo.FetchPartition, 1),
+		orderedFetches:  make(chan kgo.FetchPartition),
 	}
 
 	var err error
@@ -947,6 +947,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				})
 				level.Info(logger).Log("msg", "starting to fetch", "start_offset", w.startOffset, "end_offset", w.endOffset)
 				for attempt := 0; boff.Ongoing() && w.endOffset > w.startOffset; attempt++ {
+					fetchStartTime := time.Now()
 					f, fetchedBytes := r.fetchSingle(ctx, w, logger)
 					if f.Err != nil {
 						level.Info(logger).Log("msg", "fetcher got en error", "err", f.Err, "num_records", len(f.Records))
@@ -967,6 +968,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 					lastOffset := f.Records[len(f.Records)-1].Offset
 					level.Info(logger).Log(
 						"msg", "fetched records",
+						"duration", time.Since(fetchStartTime),
 						"attempt", attempt,
 						"start_offset", w.startOffset,
 						"end_offset", w.endOffset,
@@ -982,11 +984,6 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 					bytesPerRecord := fetchedBytes / len(f.Records)
 					w.maxBytes = max(1_000_000, int32(float64(bytesPerRecord))*int32(w.endOffset-w.startOffset)) // when we have only a few records to fetch we can afford to overfetch in order to not do more requests.
 
-					if lastOffset > w.endOffset {
-						// trim the last N records that are out of bounds
-						// This assumes that there are no gaps in records.
-						f.Records = f.Records[:len(f.Records)-(int(lastOffset)-int(w.endOffset))]
-					}
 					select {
 					case w.result <- fetchResult{FetchPartition: f, fetchedBytes: fetchedBytes}:
 					case <-ctx.Done():
@@ -1065,7 +1062,7 @@ func fetchWantFrom(bytesPerRecord int, offset int64, recordsPerFetch int) fetchW
 	return fetchWant{
 		startOffset: offset,
 		endOffset:   offset + int64(recordsPerFetch),
-		result:      make(chan fetchResult, 1),
+		result:      make(chan fetchResult, 1), // buffer of 1 to reduce impact of refetches
 		maxBytes:    int32(recordsPerFetch * bytesPerRecord),
 	}
 }
