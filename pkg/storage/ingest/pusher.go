@@ -274,7 +274,8 @@ type shardedPush struct {
 
 type shardingPusher struct {
 	numShards             int
-	shards                []chan shardedPush
+	shards                []chan flushableWriteRequest
+	unfilledShards        []*mimirpb.WriteRequest
 	upstream              Pusher
 	wg                    *sync.WaitGroup
 	errs                  chan error
@@ -290,11 +291,13 @@ func newShardingPusher(numTimeSeriesPerFlush prometheus.Histogram, numShards int
 		batchSize:             batchSize,
 		wg:                    &sync.WaitGroup{},
 		errs:                  make(chan error, numShards),
+		unfilledShards:        make([]*mimirpb.WriteRequest, numShards),
 	}
-	shards := make([]chan shardedPush, numShards)
+	shards := make([]chan flushableWriteRequest, numShards)
 	pusher.wg.Add(numShards)
 	for i := range shards {
-		shards[i] = make(chan shardedPush)
+		pusher.unfilledShards[i] = &mimirpb.WriteRequest{Timeseries: mimirpb.PreallocTimeseriesSliceFromPool()}
+		shards[i] = make(chan flushableWriteRequest, 2000)
 		go pusher.runShard(shards[i])
 	}
 	go func() {
@@ -317,59 +320,54 @@ func (p *shardingPusher) PushToStorage(ctx context.Context, request *mimirpb.Wri
 		mimirpb.FromLabelAdaptersOverwriteLabels(&builder, ts.Labels, &nonCopiedLabels)
 		shard := nonCopiedLabels.Hash() % uint64(p.numShards)
 
-	tryPush:
+		s := p.unfilledShards[shard]
+		// TODO dimitarvdimitrov support metadata
+		s.Timeseries = append(s.Timeseries, ts)
+
+		if len(s.Timeseries) < p.batchSize {
+			continue
+		}
+		p.unfilledShards[shard] = &mimirpb.WriteRequest{Timeseries: mimirpb.PreallocTimeseriesSliceFromPool()}
+		flushDest := p.shards[shard]
+
+	tryFlush:
 		for {
 			select {
-			case p.shards[shard] <- shardedPush{ts, ctx}:
-				break tryPush
+			case flushDest <- flushableWriteRequest{s, ctx}:
+				flushDest = nil // drain the errors
 			case err := <-p.errs:
+				// only check for errors on a flush. This amortizes the cost of checking the channel.
 				errs.Add(err)
-			case <-ctx.Done():
-				return ctx.Err()
+			default:
+				break tryFlush
 			}
 		}
 	}
 	return errs.Err()
 }
 
-// TODO dimitarvdimitrov support metadata
-func (p *shardingPusher) runShard(timeseries chan shardedPush) {
-	type flushableWriteRequest struct {
-		*mimirpb.WriteRequest
-		context.Context
-	}
+type flushableWriteRequest struct {
+	*mimirpb.WriteRequest
+	context.Context
+}
 
-	toFlush := make(chan flushableWriteRequest, 2000)
-	defer close(toFlush)
-
-	go func() {
-		defer p.wg.Done()
-		for wr := range toFlush {
-			p.numTimeSeriesPerFlush.Observe(float64(len(wr.WriteRequest.Timeseries)))
-			err := p.upstream.PushToStorage(wr.Context, wr.WriteRequest)
-			if err != nil {
-				p.errs <- err
-			}
+func (p *shardingPusher) runShard(toFlush chan flushableWriteRequest) {
+	defer p.wg.Done()
+	for wr := range toFlush {
+		p.numTimeSeriesPerFlush.Observe(float64(len(wr.WriteRequest.Timeseries)))
+		err := p.upstream.PushToStorage(wr.Context, wr.WriteRequest)
+		if err != nil {
+			p.errs <- err
 		}
-	}()
-	timeseriesBatch := mimirpb.PreallocTimeseriesSliceFromPool()
-
-	var lastCtx context.Context
-	for ts := range timeseries {
-		timeseriesBatch = append(timeseriesBatch, ts.PreallocTimeseries)
-		if len(timeseriesBatch) == p.batchSize {
-			// TODO dimitarvdimitrov this breaks tracing because we might not use the spans from all of the requests
-			toFlush <- flushableWriteRequest{Context: ts.Context, WriteRequest: &mimirpb.WriteRequest{Timeseries: timeseriesBatch}}
-			timeseriesBatch = mimirpb.PreallocTimeseriesSliceFromPool()
-		}
-		lastCtx = ts.Context
-	}
-	if len(timeseriesBatch) > 0 {
-		toFlush <- flushableWriteRequest{Context: lastCtx, WriteRequest: &mimirpb.WriteRequest{Timeseries: timeseriesBatch}}
 	}
 }
 
 func (p *shardingPusher) close() error {
+	for shard, wr := range p.unfilledShards {
+		if len(wr.Timeseries) > 0 {
+			p.shards[shard] <- flushableWriteRequest{wr, context.Background()} // TODO dimitarvdimitrov use a proper context
+		}
+	}
 	for _, shard := range p.shards {
 		close(shard)
 	}
