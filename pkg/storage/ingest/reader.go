@@ -35,6 +35,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.uber.org/atomic"
 
+	"github.com/grafana/mimir/pkg/mimirpb"
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
@@ -102,6 +103,12 @@ func (c consumerFactoryFunc) consumer() consumerCloser {
 
 type noopPusherCloser struct {
 	Pusher
+	numTimeSeriesPerFlush prometheus.Histogram
+}
+
+func (c noopPusherCloser) PushToStorage(ctx context.Context, wr *mimirpb.WriteRequest) error {
+	c.numTimeSeriesPerFlush.Observe(float64(len(wr.Timeseries)))
+	return c.Pusher.PushToStorage(ctx, wr)
 }
 
 func (noopPusherCloser) Close() []error {
@@ -117,7 +124,7 @@ func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instan
 	})
 	factory := consumerFactoryFunc(func() consumerCloser {
 		if kafkaCfg.ReplayShards == 0 {
-			return newPusherConsumer(noopPusherCloser{pusher}, consumerProto)
+			return newPusherConsumer(noopPusherCloser{pusher, numTimeSeriesPerFlush}, consumerProto)
 		}
 		return newPusherConsumer(newMultiTenantPusher(numTimeSeriesPerFlush, pusher, kafkaCfg.ReplayShards, kafkaCfg.BatchSize), consumerProto)
 	})
