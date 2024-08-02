@@ -862,7 +862,6 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 }
 
 func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logger log.Logger) kgo.FetchPartition {
-	level.Debug(logger).Log("msg", "fetching", "offset", w.startOffset, "partition", r.partitionID, "topic", r.topicName)
 	req := kmsg.NewFetchRequest()
 	req.Topics = []kmsg.FetchRequestTopic{{
 		Topic:   r.topicName,
@@ -894,15 +893,6 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logge
 	rawPartitionResp := resp.Topics[0].Partitions[0]
 	r.metrics.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
-	level.Info(logger).Log(
-		"msg", "fetched records",
-		"error_code", resp.ErrorCode,
-		"num_records", len(partition.Records),
-		"num_topics", len(resp.Topics),
-		"num_partitions", len(resp.Topics[0].Partitions),
-		"error", partition.Err,
-		"current_leader_epoch", rawPartitionResp.CurrentLeader.LeaderEpoch,
-	)
 	partition.EachRecord(r.tracer.OnFetchRecordBuffered) // TODO dimitarvdimitrov we might end up buffering the same record multiple times - what happens then?
 	return partition
 }
@@ -950,7 +940,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 					MaxRetries: 0, // retry forever
 				})
 				level.Info(logger).Log("msg", "starting to fetch", "start_offset", w.startOffset, "end_offset", w.endOffset)
-				for boff.Ongoing() && w.endOffset > w.startOffset {
+				for attempt := 0; boff.Ongoing() && w.endOffset > w.startOffset; attempt++ {
 					f := r.fetchSingle(ctx, w, logger)
 					if f.Err != nil {
 						level.Info(logger).Log("msg", "fetcher got en error", "err", f.Err, "num_records", len(f.Records))
@@ -969,9 +959,27 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 					}
 					boff.Reset()
 					lastOffset := f.Records[len(f.Records)-1].Offset
+					level.Info(logger).Log(
+						"msg", "fetched records",
+						"attempt", attempt,
+						"start_offset", w.startOffset,
+						"end_offset", w.endOffset,
+						"asked_records", w.endOffset-w.startOffset,
+						"got_records", len(f.Records),
+						"diff_records", int(w.endOffset-w.startOffset)-len(f.Records),
+						"asked_bytes", w.maxBytes,
+						"got_bytes", bytesPerRecord(f)*len(f.Records),
+						"diff_bytes", int(w.maxBytes)-bytesPerRecord(f)*len(f.Records),
+						"remaining_records", w.endOffset-lastOffset,
+					)
 					w.startOffset = lastOffset + 1
-					w.maxBytes = int32((w.endOffset-w.startOffset)*70_000) + 1_000_000 // add 1MiB just to make sure we don't end up refetching forever
-					level.Info(logger).Log("msg", "received records", "new_start_offset", w.startOffset, "new_end_offset", w.endOffset)
+					w.maxBytes = int32(bytesPerRecord(f)) * int32(w.endOffset-w.startOffset)
+
+					if lastOffset > w.endOffset {
+						// trim the last N records that are out of bounds
+						// This assumes that there are no gaps in records.
+						f.Records = f.Records[:len(f.Records)-(int(lastOffset)-int(w.endOffset))]
+					}
 					select {
 					case w.result <- f:
 					case <-ctx.Done():
@@ -983,11 +991,11 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 
 	var (
-		nextFetch  = fetchWantFrom(startOffset, r.recordsPerFetch)
-		nextResult chan kgo.FetchPartition
-		results    = list.New()
+		bytesPerRecord = 70_000 // start with an estimation, we will update it as we consume
+		nextFetch      = fetchWantFrom(bytesPerRecord, startOffset, r.recordsPerFetch)
+		nextResult     chan kgo.FetchPartition
+		results        = list.New()
 	)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -998,7 +1006,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				nextResult = results.Front().Value.(chan kgo.FetchPartition)
 				results.Remove(results.Front())
 			}
-			nextFetch = nextFetchWant(nextFetch, r.recordsPerFetch)
+			nextFetch = nextFetchWant(bytesPerRecord, nextFetch, r.recordsPerFetch)
 		case result, moreLeft := <-nextResult:
 			if !moreLeft {
 				if results.Len() > 0 {
@@ -1009,6 +1017,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				}
 				continue
 			}
+			bytesPerRecord = estimateBytesPerRecord(bytesPerRecord, result)
 			select {
 			case r.orderedFetches <- result:
 			case <-ctx.Done():
@@ -1018,12 +1027,28 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 }
 
-func nextFetchWant(fetch fetchWant, recordsPerFetch int) fetchWant {
-	return fetchWantFrom(fetch.endOffset, recordsPerFetch)
+func estimateBytesPerRecord(currentBytesPerRecord int, result kgo.FetchPartition) int {
+	const currentFetchFactor = 0.8
+	return int(
+		1.05 * // overestimate by 5% to avoid overfetching
+			((1-currentFetchFactor)*float64(currentBytesPerRecord) +
+				currentFetchFactor*float64(bytesPerRecord(result))),
+	)
 }
 
-func fetchWantFrom(offset int64, recordsPerFetch int) fetchWant {
-	const bytesPerRecord = 70_000 // TODO dimitarvdimitrov either make this configurable or make this self-tunable based on the last few fetches
+func bytesPerRecord(result kgo.FetchPartition) int {
+	totalBytes := 0
+	result.EachRecord(func(r *kgo.Record) {
+		totalBytes += len(r.Value)
+	})
+	return totalBytes / len(result.Records)
+}
+
+func nextFetchWant(bytesPerRecord int, fetch fetchWant, recordsPerFetch int) fetchWant {
+	return fetchWantFrom(bytesPerRecord, fetch.endOffset, recordsPerFetch)
+}
+
+func fetchWantFrom(bytesPerRecord int, offset int64, recordsPerFetch int) fetchWant {
 	return fetchWant{
 		startOffset: offset,
 		endOffset:   offset + int64(recordsPerFetch),
