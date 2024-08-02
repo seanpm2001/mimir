@@ -829,24 +829,21 @@ func newConcurrentFetchers(ctx context.Context, client *kgo.Client, logger log.L
 }
 
 func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetches) {
-	defer func(start time.Time) {
-		r.metrics.fetchWaitDuration.Observe(time.Since(start).Seconds())
-		result.EachRecord(func(record *kgo.Record) {
-			r.metrics.fetchedBytes.Add(float64(len(record.Value))) // TODO dimitarvdimitrov make sure we're not conflicting with the actual client; perhaps disable metrics there and just use our own
-		})
-	}(time.Now())
-
+	waitStartTime := time.Now()
 	select {
 	case <-ctx.Done():
 		return kgo.Fetches{}
 	case f := <-r.orderedFetches:
-		r.logger.Log("msg", "received ordered fetch", "num_records", len(f.Records))
+		level.Info(r.logger).Log("msg", "received ordered fetch", "num_records", len(f.Records), "wait_duration", time.Since(waitStartTime))
+		r.metrics.fetchWaitDuration.Observe(time.Since(waitStartTime).Seconds())
 		trimUntil := 0
 		f.EachRecord(func(record *kgo.Record) {
-			r.tracer.OnFetchRecordUnbuffered(record, true)
+			r.metrics.fetchedBytes.Add(float64(len(record.Value))) // TODO dimitarvdimitrov maybe use the same metric name as franz-go, but make sure we're not conflicting with the actual client; perhaps disable metrics there and just use our own
 			if record.Offset <= r.lastReturnedRecord {
 				trimUntil++
+				return // don't finish the traces multiple times
 			}
+			r.tracer.OnFetchRecordUnbuffered(record, true)
 		})
 
 		r.lastReturnedRecord = f.Records[len(f.Records)-1].Offset
@@ -906,7 +903,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logge
 		"error", partition.Err,
 		"current_leader_epoch", rawPartitionResp.CurrentLeader.LeaderEpoch,
 	)
-	partition.EachRecord(r.tracer.OnFetchRecordBuffered)
+	partition.EachRecord(r.tracer.OnFetchRecordBuffered) // TODO dimitarvdimitrov we might end up buffering the same record multiple times - what happens then?
 	return partition
 }
 
