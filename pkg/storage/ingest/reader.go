@@ -979,9 +979,8 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 						"remaining_records", w.endOffset-lastOffset,
 					)
 					w.startOffset = lastOffset + 1
-					const overfetchFactor = 1.1
 					bytesPerRecord := fetchedBytes / len(f.Records)
-					w.maxBytes = int32(float64(bytesPerRecord)*overfetchFactor) * int32(w.endOffset-w.startOffset)
+					w.maxBytes = max(1_000_000, int32(float64(bytesPerRecord))*int32(w.endOffset-w.startOffset)) // when we have only a few records to fetch we can afford to overfetch in order to not do more requests.
 
 					if lastOffset > w.endOffset {
 						// trim the last N records that are out of bounds
@@ -999,48 +998,62 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 
 	var (
-		bytesPerRecord = 70_000 // start with an estimation, we will update it as we consume
+		bytesPerRecord = 10_000 // start with an estimation, we will update it as we consume
 		nextFetch      = fetchWantFrom(bytesPerRecord, startOffset, r.recordsPerFetch)
 		nextResult     chan fetchResult
-		results        = list.New()
+		pendingResults = list.New()
+
+		bufferedResult       fetchResult
+		readyBufferedResults chan kgo.FetchPartition // this is non-nil when bufferedResult is non-empty
 	)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case wants <- nextFetch:
-			results.PushBack(nextFetch.result)
+			pendingResults.PushBack(nextFetch.result)
 			if nextResult == nil {
-				nextResult = results.Front().Value.(chan fetchResult)
-				results.Remove(results.Front())
+				// In case we previously exhausted pendingResults, we just created
+				nextResult = pendingResults.Front().Value.(chan fetchResult)
+				pendingResults.Remove(pendingResults.Front())
 			}
 			nextFetch = nextFetchWant(bytesPerRecord, nextFetch, r.recordsPerFetch)
+		case readyBufferedResults <- bufferedResult.FetchPartition:
+			readyBufferedResults = nil
+			bufferedResult = fetchResult{}
+		default:
+		}
+
+		if len(bufferedResult.Records) > 0 {
+			// We have a single result that's still not consumed.
+			// So we don't try to get new results from the fetchers.
+			continue
+		}
+		// Otherwise, try to get a new result from the fetchers.
+		select {
 		case result, moreLeft := <-nextResult:
 			if !moreLeft {
-				if results.Len() > 0 {
-					nextResult = results.Front().Value.(chan fetchResult)
-					results.Remove(results.Front())
+				if pendingResults.Len() > 0 {
+					nextResult = pendingResults.Front().Value.(chan fetchResult)
+					pendingResults.Remove(pendingResults.Front())
 				} else {
 					nextResult = nil
 				}
 				continue
 			}
 			bytesPerRecord = estimateBytesPerRecord(bytesPerRecord, result.fetchedBytes, len(result.Records))
-			select {
-			case r.orderedFetches <- result.FetchPartition:
-			case <-ctx.Done():
-				return
-			}
+			bufferedResult = result
+			readyBufferedResults = r.orderedFetches
+		default:
 		}
 	}
 }
 
-func estimateBytesPerRecord(currentBytesPerRecord, numRecords, recordsSizeBytes int) int {
+func estimateBytesPerRecord(currentBytesPerRecord, recordsSizeBytes, numRecords int) int {
 	const currentFetchFactor = 0.8
 	return int(
-		1.05 * // overestimate by 5% to avoid overfetching
-			((1-currentFetchFactor)*float64(currentBytesPerRecord) +
-				currentFetchFactor*float64(recordsSizeBytes/numRecords)),
+		(1-currentFetchFactor)*float64(currentBytesPerRecord) +
+			currentFetchFactor*float64(recordsSizeBytes/numRecords),
 	)
 }
 
