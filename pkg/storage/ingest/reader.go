@@ -1004,9 +1004,16 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 		readyBufferedResults chan kgo.FetchPartition // this is non-nil when bufferedResult is non-empty
 	)
 	for {
+		refillBufferedResult := nextResult
+		if len(bufferedResult.Records) > 0 {
+			// We have a single result that's still not consumed.
+			// So we don't try to get new results from the fetchers.
+			refillBufferedResult = nil
+		}
 		select {
 		case <-ctx.Done():
 			return
+
 		case wants <- nextFetch:
 			pendingResults.PushBack(nextFetch.result)
 			if nextResult == nil {
@@ -1015,20 +1022,8 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				pendingResults.Remove(pendingResults.Front())
 			}
 			nextFetch = nextFetchWant(bytesPerRecord, nextFetch, r.recordsPerFetch)
-		case readyBufferedResults <- bufferedResult.FetchPartition:
-			readyBufferedResults = nil
-			bufferedResult = fetchResult{}
-		default:
-		}
 
-		if len(bufferedResult.Records) > 0 {
-			// We have a single result that's still not consumed.
-			// So we don't try to get new results from the fetchers.
-			continue
-		}
-		// Otherwise, try to get a new result from the fetchers.
-		select {
-		case result, moreLeft := <-nextResult:
+		case result, moreLeft := <-refillBufferedResult:
 			if !moreLeft {
 				if pendingResults.Len() > 0 {
 					nextResult = pendingResults.Front().Value.(chan fetchResult)
@@ -1041,7 +1036,10 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 			bytesPerRecord = estimateBytesPerRecord(bytesPerRecord, result.fetchedBytes, len(result.Records))
 			bufferedResult = result
 			readyBufferedResults = r.orderedFetches
-		default:
+
+		case readyBufferedResults <- bufferedResult.FetchPartition:
+			readyBufferedResults = nil
+			bufferedResult = fetchResult{}
 		}
 	}
 }
