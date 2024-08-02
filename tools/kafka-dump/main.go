@@ -16,38 +16,10 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/plugin/kprom"
 	"go.uber.org/atomic"
-
-	"github.com/grafana/mimir/pkg/mimirpb"
 )
 
 func main() {
 
-	bytes, err := os.ReadFile("write-request.pb")
-	if err != nil {
-		panic(err)
-	}
-	wr := mimirpb.WriteRequest{}
-	err = wr.Unmarshal(bytes)
-	if err != nil {
-		panic(err)
-	}
-	j, err := json.Marshal(wr)
-	if err != nil {
-		panic(err)
-	}
-
-	for seriesIdx, v := range wr.Timeseries {
-		labels := map[string]string{}
-		for _, l := range v.Labels {
-			if labels[l.Name] != "" {
-				//fmt.Println("duplicate label", l.Name, "series", seriesIdx)
-			}
-			_ = seriesIdx
-			labels[l.Name] = l.Value
-		}
-	}
-	fmt.Println(string(j))
-	return
 	topic := flag.String("topic", "mimir", "Kafka topic to dump")
 	brokers := flag.String("brokers", "localhost:9092", "Kafka brokers")
 	partition := flag.Int("partition", 0, "Kafka partition to dump or import into")
@@ -137,8 +109,9 @@ func doExport(output io.Writer, topicName string, broker string, partition int, 
 }
 
 var (
-	recordCount    = &atomic.Int64{}
-	consumedOffset = &atomic.Int64{}
+	recordCount     = &atomic.Int64{}
+	consumedOffset  = &atomic.Int64{}
+	recordsTooLarge = &atomic.Int64{}
 )
 
 func doImport(from io.Reader, topic, broker string, partition, skipUntil int) error {
@@ -148,8 +121,8 @@ func doImport(from io.Reader, topic, broker string, partition, skipUntil int) er
 		kgo.SeedBrokers(broker),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 		kgo.DisableIdempotentWrite(),
-		kgo.ProducerLinger(time.Millisecond*100),
-		kgo.ProducerBatchMaxBytes(10_000_000),
+		kgo.BrokerMaxWriteBytes(268_435_456),
+		kgo.MaxBufferedBytes(268_435_456),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create kafka client: %w", err)
@@ -162,7 +135,7 @@ func doImport(from io.Reader, topic, broker string, partition, skipUntil int) er
 	go func() {
 		for {
 			time.Sleep(time.Second)
-			fmt.Printf("produced items: %d, buffered records: %d, buffered bytes: %d\n", recordCount.Load(), client.BufferedProduceRecords(), client.BufferedProduceBytes())
+			fmt.Printf("produced items: %d, of those skipped because too large: %d, buffered records: %d, buffered bytes: %d\n", recordCount.Load(), recordsTooLarge.Load(), client.BufferedProduceRecords(), client.BufferedProduceBytes())
 		}
 	}()
 
@@ -185,6 +158,7 @@ func doImport(from io.Reader, topic, broker string, partition, skipUntil int) er
 		client.Produce(context.Background(), record, func(record *kgo.Record, err error) {
 			recordCount.Inc()
 			if errors.Is(err, kerr.MessageTooLarge) {
+				recordsTooLarge.Inc()
 				return
 			}
 			if err != nil {
