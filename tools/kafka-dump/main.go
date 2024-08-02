@@ -109,9 +109,10 @@ func doExport(output io.Writer, topicName string, broker string, partition int, 
 }
 
 var (
-	recordCount     = &atomic.Int64{}
-	consumedOffset  = &atomic.Int64{}
-	recordsTooLarge = &atomic.Int64{}
+	recordCount          = &atomic.Int64{}
+	consumedOffset       = &atomic.Int64{}
+	recordsTooLarge      = &atomic.Int64{}
+	corruptedJSONRecords = &atomic.Int64{}
 )
 
 func doImport(from io.Reader, topic, broker string, partition, skipUntil int) error {
@@ -142,18 +143,21 @@ func doImport(from io.Reader, topic, broker string, partition, skipUntil int) er
 	separator := bufio.NewScanner(from)
 	separator.Buffer(make([]byte, 10_000_000), 10_000_000) // 10MB buffer because we can have large records
 
-	for separator.Scan() {
+	for recordsIdx := 0; separator.Scan(); recordsIdx++ {
 		item := separator.Bytes()
 		record := &kgo.Record{}
 		err = json.Unmarshal(item, record)
 		if err != nil {
-			return fmt.Errorf("failed to unmarshal record: %w", err)
+			corruptedJSONRecords.Inc()
+			_, _ = fmt.Fprintf(os.Stderr, "corrupted JSON record %d: %v\n", recordsIdx, err)
+			continue
 		}
 		if record.Offset < int64(skipUntil) {
 			continue
 		}
 		record.Topic = topic
 		record.Partition = int32(partition)
+		record.Context = context.WithValue(context.Background(), "original_offset", record.Offset)
 
 		client.Produce(context.Background(), record, func(record *kgo.Record, err error) {
 			recordCount.Inc()
