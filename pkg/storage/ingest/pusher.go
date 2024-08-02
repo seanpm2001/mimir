@@ -334,29 +334,38 @@ func (p *shardingPusher) PushToStorage(ctx context.Context, request *mimirpb.Wri
 
 // TODO dimitarvdimitrov support metadata
 func (p *shardingPusher) runShard(timeseries chan shardedPush) {
-	defer p.wg.Done()
-	timeseriesBatch := mimirpb.PreallocTimeseriesSliceFromPool()
-
-	flush := func(ctx context.Context) {
-		p.numTimeSeriesPerFlush.Observe(float64(len(timeseriesBatch)))
-		err := p.upstream.PushToStorage(ctx, &mimirpb.WriteRequest{Timeseries: timeseriesBatch})
-		if err != nil {
-			p.errs <- err
-		}
-		timeseriesBatch = mimirpb.PreallocTimeseriesSliceFromPool()
+	type flushableWriteRequest struct {
+		*mimirpb.WriteRequest
+		context.Context
 	}
+
+	toFlush := make(chan flushableWriteRequest, 2000)
+	defer close(toFlush)
+
+	go func() {
+		defer p.wg.Done()
+		for wr := range toFlush {
+			p.numTimeSeriesPerFlush.Observe(float64(len(wr.WriteRequest.Timeseries)))
+			err := p.upstream.PushToStorage(wr.Context, wr.WriteRequest)
+			if err != nil {
+				p.errs <- err
+			}
+		}
+	}()
+	timeseriesBatch := mimirpb.PreallocTimeseriesSliceFromPool()
 
 	var lastCtx context.Context
 	for ts := range timeseries {
 		timeseriesBatch = append(timeseriesBatch, ts.PreallocTimeseries)
 		if len(timeseriesBatch) == p.batchSize {
 			// TODO dimitarvdimitrov this breaks tracing because we might not use the spans from all of the requests
-			flush(ts.Context)
+			toFlush <- flushableWriteRequest{Context: ts.Context, WriteRequest: &mimirpb.WriteRequest{Timeseries: timeseriesBatch}}
+			timeseriesBatch = mimirpb.PreallocTimeseriesSliceFromPool()
 		}
 		lastCtx = ts.Context
 	}
 	if len(timeseriesBatch) > 0 {
-		flush(lastCtx)
+		toFlush <- flushableWriteRequest{Context: lastCtx, WriteRequest: &mimirpb.WriteRequest{Timeseries: timeseriesBatch}}
 	}
 }
 
