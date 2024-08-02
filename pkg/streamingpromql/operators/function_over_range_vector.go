@@ -23,7 +23,7 @@ type FunctionOverRangeVector struct {
 	Inner types.RangeVectorOperator
 	Pool  *pooling.LimitingPool
 
-	MetadataFunc         functions.SeriesMetadataFunction
+	SeriesMetadataFunc   functions.SeriesMetadataFunction
 	StepFunc             functions.RangeVectorStepFunction
 	SeriesValidationFunc functions.RangeVectorSeriesValidationFunction
 
@@ -55,7 +55,7 @@ func NewFunctionOverRangeVector(
 	o := &FunctionOverRangeVector{
 		Inner:                inner,
 		Pool:                 pool,
-		MetadataFunc:         metadataFunc,
+		SeriesMetadataFunc:   metadataFunc,
 		StepFunc:             stepFunc,
 		SeriesValidationFunc: seriesValidationFunc,
 		Annotations:          annotations,
@@ -86,7 +86,7 @@ func (m *FunctionOverRangeVector) SeriesMetadata(ctx context.Context) ([]types.S
 	m.numSteps = m.Inner.StepCount()
 	m.rangeSeconds = m.Inner.Range().Seconds()
 
-	return m.MetadataFunc(metadata, m.Pool)
+	return m.SeriesMetadataFunc(metadata, m.Pool)
 }
 
 func (m *FunctionOverRangeVector) NextSeries(ctx context.Context) (types.InstantVectorSeriesData, error) {
