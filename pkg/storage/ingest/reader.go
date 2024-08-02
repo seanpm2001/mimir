@@ -20,6 +20,7 @@ import (
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/multierror"
 	"github.com/grafana/dskit/services"
+	"github.com/klauspost/compress/s2"
 	"github.com/pierrec/lz4/v4"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -863,8 +864,8 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 	}
 }
 
-func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant) kgo.FetchPartition {
-	level.Debug(r.logger).Log("msg", "fetching", "offset", w.startOffset, "partition", r.partitionID, "topic", r.topicName)
+func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logger log.Logger) kgo.FetchPartition {
+	level.Debug(logger).Log("msg", "fetching", "offset", w.startOffset, "partition", r.partitionID, "topic", r.topicName)
 	req := kmsg.NewFetchRequest()
 	req.Topics = []kmsg.FetchRequestTopic{{
 		Topic:   r.topicName,
@@ -896,7 +897,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant) kgo.F
 	rawPartitionResp := resp.Topics[0].Partitions[0]
 	r.metrics.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
-	level.Info(r.logger).Log(
+	level.Info(logger).Log(
 		"msg", "fetched records",
 		"error_code", resp.ErrorCode,
 		"num_records", len(partition.Records),
@@ -953,7 +954,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				})
 				level.Info(logger).Log("msg", "starting to fetch", "start_offset", w.startOffset, "end_offset", w.endOffset)
 				for boff.Ongoing() && w.endOffset > w.startOffset {
-					f := r.fetchSingle(ctx, w)
+					f := r.fetchSingle(ctx, w, logger)
 					if f.Err != nil {
 						level.Info(logger).Log("msg", "fetcher got en error", "err", f.Err, "num_records", len(f.Records))
 					}
@@ -1269,18 +1270,23 @@ type codecType int8
 
 const (
 	codecNone codecType = iota
-	codecGzip
+	codecGzip           // TODO dimitarvdimitrov add support
 	codecSnappy
 	codecLZ4
-	codecZstd
+	codecZstd // TODO dimitarvdimitrov add support
 )
 
 func decompress(src []byte, codec byte) ([]byte, error) {
 	switch codecType(codec) {
 	case codecNone:
 		return src, nil
+	case codecSnappy:
+		if len(src) > 16 && bytes.HasPrefix(src, xerialPfx) {
+			return xerialDecode(src)
+		}
+		return s2.Decode(nil, src)
 	case codecLZ4:
-		unlz4 := lz4.NewReader(nil)
+		unlz4 := lz4.NewReader(nil) // TODO dimitarvdimitrov pool
 		unlz4.Reset(bytes.NewReader(src))
 		out := new(bytes.Buffer)
 		if _, err := io.Copy(out, unlz4); err != nil {
@@ -1290,6 +1296,36 @@ func decompress(src []byte, codec byte) ([]byte, error) {
 	default:
 		return nil, errors.New("unknown compression codec")
 	}
+}
+
+var xerialPfx = []byte{130, 83, 78, 65, 80, 80, 89, 0}
+
+var errMalformedXerial = errors.New("malformed xerial framing")
+
+func xerialDecode(src []byte) ([]byte, error) {
+	// bytes 0-8: xerial header
+	// bytes 8-16: xerial version
+	// everything after: uint32 chunk size, snappy chunk
+	// we come into this function knowing src is at least 16
+	src = src[16:]
+	var dst, chunk []byte
+	var err error
+	for len(src) > 0 {
+		if len(src) < 4 {
+			return nil, errMalformedXerial
+		}
+		size := int32(binary.BigEndian.Uint32(src))
+		src = src[4:]
+		if size < 0 || len(src) < int(size) {
+			return nil, errMalformedXerial
+		}
+		if chunk, err = s2.Decode(chunk[:cap(chunk)], src[:size]); err != nil {
+			return nil, err
+		}
+		src = src[size:]
+		dst = append(dst, chunk...)
+	}
+	return dst, nil
 }
 
 type partitionCommitter struct {
