@@ -555,14 +555,14 @@ func (r *PartitionReader) newKafkaReader(at kgo.Offset) (*kgo.Client, error) {
 			r.kafkaCfg.Topic: {r.partitionID: at},
 		}),
 		kgo.FetchMinBytes(1),
-		kgo.FetchMaxBytes(fetchMaxBytes),
+		kgo.FetchMaxBytes(fetchMaxBytes), // these are unused by concurrent fetchers
 		kgo.FetchMaxWait(5*time.Second),
-		kgo.FetchMaxPartitionBytes(50_000_000),
+		kgo.FetchMaxPartitionBytes(50_000_000), // these are unused by concurrent fetchers
 
 		// BrokerMaxReadBytes sets the maximum response size that can be read from
 		// Kafka. This is a safety measure to avoid OOMing on invalid responses.
 		// franz-go recommendation is to set it 2x FetchMaxBytes.
-		kgo.BrokerMaxReadBytes(2*fetchMaxBytes),
+		kgo.BrokerMaxReadBytes(1_000_000_000),
 	)
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
@@ -772,8 +772,13 @@ type fetchWant struct {
 	startOffset int64 // inclusive
 	endOffset   int64 // exclusive
 	// result should be closed when there are no more fetches for this partition. It is ok to send multiple times on the channel.
-	result   chan kgo.FetchPartition
+	result   chan fetchResult
 	maxBytes int32
+}
+
+type fetchResult struct {
+	kgo.FetchPartition
+	fetchedBytes int
 }
 
 type concurrentFetchers struct {
@@ -861,7 +866,7 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 	}
 }
 
-func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logger log.Logger) kgo.FetchPartition {
+func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logger log.Logger) (_ kgo.FetchPartition, fetchedBytes int) {
 	req := kmsg.NewFetchRequest()
 	req.Topics = []kmsg.FetchRequestTopic{{
 		Topic:   r.topicName,
@@ -884,17 +889,18 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, w fetchWant, logge
 	resp, err := req.RequestWith(ctx, r.client)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return kgo.FetchPartition{}
+			return kgo.FetchPartition{}, 0
 		}
 		return kgo.FetchPartition{
 			Err: fmt.Errorf("fetching from kafka: %w", err),
-		}
+		}, 0
 	}
 	rawPartitionResp := resp.Topics[0].Partitions[0]
-	r.metrics.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
+	fetchedBytes = len(rawPartitionResp.RecordBatches)
+	r.metrics.fetchesCompressedBytes.Add(float64(fetchedBytes)) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
 	partition.EachRecord(r.tracer.OnFetchRecordBuffered) // TODO dimitarvdimitrov we might end up buffering the same record multiple times - what happens then?
-	return partition
+	return partition, fetchedBytes
 }
 
 // getStartOffset does roughly what franz-go does - issues a ListOffsets request to Kafka to get the start offset.
@@ -941,7 +947,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 				})
 				level.Info(logger).Log("msg", "starting to fetch", "start_offset", w.startOffset, "end_offset", w.endOffset)
 				for attempt := 0; boff.Ongoing() && w.endOffset > w.startOffset; attempt++ {
-					f := r.fetchSingle(ctx, w, logger)
+					f, fetchedBytes := r.fetchSingle(ctx, w, logger)
 					if f.Err != nil {
 						level.Info(logger).Log("msg", "fetcher got en error", "err", f.Err, "num_records", len(f.Records))
 					}
@@ -968,12 +974,14 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 						"got_records", len(f.Records),
 						"diff_records", int(w.endOffset-w.startOffset)-len(f.Records),
 						"asked_bytes", w.maxBytes,
-						"got_bytes", bytesPerRecord(f)*len(f.Records),
-						"diff_bytes", int(w.maxBytes)-bytesPerRecord(f)*len(f.Records),
+						"got_bytes", fetchedBytes,
+						"diff_bytes", int(w.maxBytes)-fetchedBytes,
 						"remaining_records", w.endOffset-lastOffset,
 					)
 					w.startOffset = lastOffset + 1
-					w.maxBytes = int32(bytesPerRecord(f)) * int32(w.endOffset-w.startOffset)
+					const overfetchFactor = 1.1
+					bytesPerRecord := fetchedBytes / len(f.Records)
+					w.maxBytes = int32(float64(bytesPerRecord)*overfetchFactor) * int32(w.endOffset-w.startOffset)
 
 					if lastOffset > w.endOffset {
 						// trim the last N records that are out of bounds
@@ -981,7 +989,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 						f.Records = f.Records[:len(f.Records)-(int(lastOffset)-int(w.endOffset))]
 					}
 					select {
-					case w.result <- f:
+					case w.result <- fetchResult{FetchPartition: f, fetchedBytes: fetchedBytes}:
 					case <-ctx.Done():
 					}
 				}
@@ -993,7 +1001,7 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	var (
 		bytesPerRecord = 70_000 // start with an estimation, we will update it as we consume
 		nextFetch      = fetchWantFrom(bytesPerRecord, startOffset, r.recordsPerFetch)
-		nextResult     chan kgo.FetchPartition
+		nextResult     chan fetchResult
 		results        = list.New()
 	)
 	for {
@@ -1003,23 +1011,23 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 		case wants <- nextFetch:
 			results.PushBack(nextFetch.result)
 			if nextResult == nil {
-				nextResult = results.Front().Value.(chan kgo.FetchPartition)
+				nextResult = results.Front().Value.(chan fetchResult)
 				results.Remove(results.Front())
 			}
 			nextFetch = nextFetchWant(bytesPerRecord, nextFetch, r.recordsPerFetch)
 		case result, moreLeft := <-nextResult:
 			if !moreLeft {
 				if results.Len() > 0 {
-					nextResult = results.Front().Value.(chan kgo.FetchPartition)
+					nextResult = results.Front().Value.(chan fetchResult)
 					results.Remove(results.Front())
 				} else {
 					nextResult = nil
 				}
 				continue
 			}
-			bytesPerRecord = estimateBytesPerRecord(bytesPerRecord, result)
+			bytesPerRecord = estimateBytesPerRecord(bytesPerRecord, result.fetchedBytes, len(result.Records))
 			select {
-			case r.orderedFetches <- result:
+			case r.orderedFetches <- result.FetchPartition:
 			case <-ctx.Done():
 				return
 			}
@@ -1027,21 +1035,13 @@ func (r *concurrentFetchers) runFetchers(ctx context.Context, startOffset int64)
 	}
 }
 
-func estimateBytesPerRecord(currentBytesPerRecord int, result kgo.FetchPartition) int {
+func estimateBytesPerRecord(currentBytesPerRecord, numRecords, recordsSizeBytes int) int {
 	const currentFetchFactor = 0.8
 	return int(
 		1.05 * // overestimate by 5% to avoid overfetching
 			((1-currentFetchFactor)*float64(currentBytesPerRecord) +
-				currentFetchFactor*float64(bytesPerRecord(result))),
+				currentFetchFactor*float64(recordsSizeBytes/numRecords)),
 	)
-}
-
-func bytesPerRecord(result kgo.FetchPartition) int {
-	totalBytes := 0
-	result.EachRecord(func(r *kgo.Record) {
-		totalBytes += len(r.Value)
-	})
-	return totalBytes / len(result.Records)
 }
 
 func nextFetchWant(bytesPerRecord int, fetch fetchWant, recordsPerFetch int) fetchWant {
@@ -1052,7 +1052,7 @@ func fetchWantFrom(bytesPerRecord int, offset int64, recordsPerFetch int) fetchW
 	return fetchWant{
 		startOffset: offset,
 		endOffset:   offset + int64(recordsPerFetch),
-		result:      make(chan kgo.FetchPartition, 1),
+		result:      make(chan fetchResult, 1),
 		maxBytes:    int32(recordsPerFetch * bytesPerRecord),
 	}
 }
